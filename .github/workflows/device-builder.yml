@@ -1,0 +1,74 @@
+name: ESPHome Device Builder
+
+on:
+  pull_request:
+    paths:
+      - '**/*.yml'
+      - '**/*.yaml'
+
+jobs:
+  device-builder:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install esphome-device-builder
+        run: pip install 'esphome-device-builder[esphome]'
+
+      - name: Stage configs dir
+        run: |
+          set -euo pipefail
+          mkdir -p configs
+          # Repo keeps device YAMLs at the root (e.g. weather-sign.yaml);
+          # stage them into ./configs so the builder has a config dir.
+          for f in *.yaml *.yml; do
+            [ -f "$f" ] || continue
+            # Don't copy a root secrets file into the staged dir blindly;
+            # it is handled below (dummy only if missing).
+            [ "$f" = "secrets.yaml" ] && continue
+            cp "$f" configs/
+          done
+          ls -la configs
+          # CI has no real secrets.yaml; supply plausible dummies for validation only.
+          if [ ! -f configs/secrets.yaml ] && [ ! -f secrets.yaml ]; then
+            DUMMY_KEY=$(python3 -c "import base64, os; print(base64.b64encode(os.urandom(32)).decode())")
+            cat > configs/secrets.yaml <<EOF
+          latitude: "37.7749"
+          longitude: "-122.4194"
+          weather_sign__encryption_key: "$DUMMY_KEY"
+          weather_sign__ota_password: "dummy-ota-password"
+          wifi_ssid: "dummy-ssid"
+          wifi_password: "dummy-password"
+          EOF
+          fi
+
+      - name: Run esphome-device-builder
+        run: |
+          set -euo pipefail
+          esphome-device-builder ./configs --log-level debug --dev > builder.log 2>&1 &
+          BUILDER_PID=$!
+          # Wait up to ~60s for the dashboard to serve its health endpoint.
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:6052/version > /dev/null; then
+              echo "device-builder is up (after ~${i}s)"
+              curl -fsS http://localhost:6052/version
+              echo
+              kill "$BUILDER_PID"
+              wait "$BUILDER_PID" || true
+              exit 0
+            fi
+            if ! kill -0 "$BUILDER_PID" 2>/dev/null; then
+              echo "device-builder exited early; log:"
+              cat builder.log
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "device-builder did not become ready in 60s; log:"
+          cat builder.log
+          kill "$BUILDER_PID" || true
+          exit 1
