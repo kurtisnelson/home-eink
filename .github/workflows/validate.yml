@@ -45,11 +45,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: ESPHome config validation
-        uses: esphome/build-action@v6
+      - uses: actions/setup-python@v5
         with:
-          yaml-file: weather-sign.yaml
-          version: stable
-          # Validate only; do not compile firmware
-          run: |
-            esphome config weather-sign.yaml
+          python-version: '3.11'
+      - name: Install ESPHome
+        run: pip install esphome
+      - name: Validate ESPHome config
+        run: |
+          # CI has no real secrets.yaml; supply plausible dummies for validation only.
+          # Never overwrite a real secrets file if one exists.
+          if [ ! -f secrets.yaml ]; then
+            DUMMY_KEY=$(python3 -c "import base64; print(base64.b64encode(bytes(32)).decode())")
+            cat > secrets.yaml <<EOF
+          latitude: "37.7749"
+          longitude: "-122.4194"
+          weather_sign__encryption_key: "$DUMMY_KEY"
+          weather_sign__ota_password: "dummy-ota-password"
+          wifi_ssid: "dummy-ssid"
+          wifi_password: "dummy-password"
+          EOF
+          fi
+          esphome config weather-sign.yaml
