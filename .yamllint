@@ -1,0 +1,10 @@
+extends: default
+
+rules:
+  # ESPHome files use custom tags and long URLs; these style rules add noise
+  document-start: disable
+  comments-indentation: disable
+  line-length:
+    max: 350
+  truthy:
+    allowed-values: ['true', 'false', 'on']

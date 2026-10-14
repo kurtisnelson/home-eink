@@ -1,0 +1,15 @@
+repos:
+  - repo: local
+    hooks:
+      - id: esphome-yaml-syntax
+        name: ESPHome YAML syntax (allows !secret tags)
+        entry: python3 scripts/validate_yaml.py
+        language: system
+        files: '\.(yaml|yml)$'
+        pass_filenames: false
+
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.37.1
+    hooks:
+      - id: yamllint
+        args: [-c, .yamllint]
