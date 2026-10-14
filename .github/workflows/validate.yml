@@ -47,9 +47,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          # ESPHome 2026.9+ requires Python >= 3.12 and knows the
+          # Seeed-reTerminal-E1001 display model used here
+          python-version: '3.13'
       - name: Install ESPHome
-        run: pip install esphome
+        run: pip install esphome==2026.9.1
       - name: Validate ESPHome config
         run: |
           # CI has no real secrets.yaml; supply plausible dummies for validation only.
