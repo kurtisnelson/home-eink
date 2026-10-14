@@ -1,0 +1,55 @@
+name: Validate ESPHome YAML
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: YAML syntax check (handles ESPHome !secret tags)
+        run: |
+          python3 - <<'EOF'
+          import glob, re, sys
+          try:
+              import yaml
+          except ImportError:
+              import subprocess
+              subprocess.check_call([sys.executable, "-m", "pip", "install", "pyyaml"])
+              import yaml
+          # Treat ESPHome custom tags (!secret, !include, !lambda, etc.) as plain scalars
+          yaml.SafeLoader.add_multi_constructor("!", lambda loader, suffix, node: (
+              loader.construct_scalar(node) if isinstance(node, yaml.ScalarNode)
+              else loader.construct_sequence(node) if isinstance(node, yaml.SequenceNode)
+              else loader.construct_mapping(node)
+          ))
+          files = sorted(glob.glob("**/*.yaml", recursive=True) + glob.glob("**/*.yml", recursive=True))
+          if not files:
+              print("No YAML files found")
+              sys.exit(1)
+          for f in files:
+              with open(f) as fh:
+                  yaml.safe_load(fh)
+              print(f"OK: {f}")
+          EOF
+      - name: yamllint
+        uses: ibiqlik/action-yamllint@v3
+        with:
+          file_or_dir: .
+          config_file: .yamllint
+
+  esphome:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: ESPHome config validation
+        uses: esphome/build-action@v6
+        with:
+          yaml-file: weather-sign.yaml
+          version: stable
+          # Validate only; do not compile firmware
+          run: |
+            esphome config weather-sign.yaml
