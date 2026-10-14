@@ -169,9 +169,8 @@ http_request:
   timeout: 15s
 json:
 
-interval:
-  - interval: 30min
-    startup_delay: 15s
+script:
+  - id: wx_fetch
     then:
       - http_request.get:
           url: https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,is_day&daily=temperature_2m_max,temperature_2m_min,weather_code,sunrise,sunset&timezone=auto&forecast_days=4&temperature_unit=fahrenheit&wind_speed_unit=mph
@@ -254,17 +253,23 @@ interval:
                         });
                     - component.update: epaper
 
+interval:
+  - interval: 30min
+    startup_delay: 15s
+    then:
+      - script.execute: wx_fetch
+
 binary_sensor:
   - platform: gpio
     pin:
-      number: GPIO14
+      number: GPIO3
       inverted: true
       mode: INPUT_PULLUP
     id: btn_refresh
     internal: true
     on_press:
       then:
-        - component.update: epaper
+        - script.execute: wx_fetch
 
 display:
   - platform: epaper_spi
@@ -322,9 +327,11 @@ display:
         it.print(180, 140, id(font_big), Color::BLACK, TextAlign::TOP_LEFT, "--F");
       }
       if (id(sun_rise).has_state() && id(sun_set).has_state()) {
-        it.printf(190, 256, id(font_mono), Color::BLACK, TextAlign::TOP_LEFT,
-          "^%s v%s", id(sun_rise).state.c_str(), id(sun_set).state.c_str());
-      } // e.g. ^6:58a v7:12p
+        it.printf(W - 20, 100, id(font_mono), Color::BLACK, TextAlign::TOP_RIGHT,
+          "^%s", id(sun_rise).state.c_str());
+        it.printf(W - 20, 140, id(font_mono), Color::BLACK, TextAlign::TOP_RIGHT,
+          "v%s", id(sun_set).state.c_str());
+      } // e.g. ^6:58a / v7:12p, right of hero
       for (int x = 20; x < W - 20; x += 6) it.filled_circle(x, 280, 1, Color::BLACK);
       // Forecast row: fixed slots, icon 64px, temps BELOW icon with gap. No overlap by construction.
       // Row budget: badge 288-318, icon 324-388, temps 394, footer 440, indoor 444-478.
