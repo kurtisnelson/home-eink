@@ -71,92 +71,53 @@ font:
     size: 24
 
 image:
-  - file: mdi:weather-sunny
-    id: icon_sunny
-    resize: 64x64
-    type: BINARY
-    transparency: chroma_key
-  - file: mdi:weather-night
-    id: icon_clear_night
-    resize: 64x64
-    type: BINARY
-    transparency: chroma_key
-  - file: mdi:weather-partly-cloudy
-    id: icon_partly
-    resize: 64x64
-    type: BINARY
-    transparency: chroma_key
-  - file: mdi:weather-cloudy
-    id: icon_cloudy
-    resize: 64x64
-    type: BINARY
-    transparency: chroma_key
-  - file: mdi:weather-fog
-    id: icon_fog
-    resize: 64x64
-    type: BINARY
-    transparency: chroma_key
-  - file: mdi:weather-pouring
-    id: icon_rain
-    resize: 64x64
-    type: BINARY
-    transparency: chroma_key
-  - file: mdi:weather-lightning-rainy
-    id: icon_storm
-    resize: 64x64
-    type: BINARY
-    transparency: chroma_key
-  - file: mdi:weather-snowy
-    id: icon_snow
-    resize: 64x64
-    type: BINARY
-    transparency: chroma_key
-  - file: mdi:weather-windy
-    id: icon_wind
-    resize: 64x64
-    type: BINARY
-    transparency: chroma_key
+  - platform: file
+    defaults:
+      type: BINARY
+      transparency: chroma_key
+      resize: 64x64
+    files:
+      - file: mdi:weather-sunny
+        id: icon_sunny
+      - file: mdi:weather-night
+        id: icon_clear_night
+      - file: mdi:weather-partly-cloudy
+        id: icon_partly
+      - file: mdi:weather-cloudy
+        id: icon_cloudy
+      - file: mdi:weather-fog
+        id: icon_fog
+      - file: mdi:weather-pouring
+        id: icon_rain
+      - file: mdi:weather-lightning-rainy
+        id: icon_storm
+      - file: mdi:weather-snowy
+        id: icon_snow
+      - file: mdi:weather-windy
+        id: icon_wind
 # Hero (current-condition) icons, large to match 72pt temperature
-  - file: mdi:weather-sunny
-    id: hero_sunny
-    resize: 140x140
-    type: BINARY
-    transparency: chroma_key
-  - file: mdi:weather-night
-    id: hero_clear_night
-    resize: 140x140
-    type: BINARY
-    transparency: chroma_key
-  - file: mdi:weather-partly-cloudy
-    id: hero_partly
-    resize: 140x140
-    type: BINARY
-    transparency: chroma_key
-  - file: mdi:weather-cloudy
-    id: hero_cloudy
-    resize: 140x140
-    type: BINARY
-    transparency: chroma_key
-  - file: mdi:weather-fog
-    id: hero_fog
-    resize: 140x140
-    type: BINARY
-    transparency: chroma_key
-  - file: mdi:weather-pouring
-    id: hero_rain
-    resize: 140x140
-    type: BINARY
-    transparency: chroma_key
-  - file: mdi:weather-lightning-rainy
-    id: hero_storm
-    resize: 140x140
-    type: BINARY
-    transparency: chroma_key
-  - file: mdi:weather-snowy
-    id: hero_snow
-    resize: 140x140
-    type: BINARY
-    transparency: chroma_key
+  - platform: file
+    defaults:
+      type: BINARY
+      transparency: chroma_key
+      resize: 140x140
+    files:
+      - file: mdi:weather-sunny
+        id: hero_sunny
+      - file: mdi:weather-night
+        id: hero_clear_night
+      - file: mdi:weather-partly-cloudy
+        id: hero_partly
+      - file: mdi:weather-cloudy
+        id: hero_cloudy
+      - file: mdi:weather-fog
+        id: hero_fog
+      - file: mdi:weather-pouring
+        id: hero_rain
+      - file: mdi:weather-lightning-rainy
+        id: hero_storm
+      - file: mdi:weather-snowy
+        id: hero_snow
 
 # All weather state lives on-device, filled by Open-Meteo fetch below.
 # Only Room Temp/Humidity + Battery are named => only those go to HA.
