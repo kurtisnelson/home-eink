@@ -169,6 +169,10 @@ text_sensor:
     id: fcst_2
   - platform: template
     id: fcst_3
+  - platform: template
+    id: sun_rise
+  - platform: template
+    id: sun_set
 
 sensor:
   - platform: template
@@ -209,7 +213,7 @@ interval:
     startup_delay: 15s
     then:
       - http_request.get:
-          url: https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,is_day&daily=temperature_2m_max,temperature_2m_min,weather_code&timezone=auto&forecast_days=4&temperature_unit=fahrenheit&wind_speed_unit=mph
+          url: https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,is_day&daily=temperature_2m_max,temperature_2m_min,weather_code,sunrise,sunset&timezone=auto&forecast_days=4&temperature_unit=fahrenheit&wind_speed_unit=mph
           capture_response: true
           max_response_buffer_size: 4096
           on_response:
@@ -242,6 +246,24 @@ interval:
                           }
                           auto daily = root["daily"];
                           if (!daily.isNull()) {
+                            // daily["sunrise"][0] / ["sunset"][0] are ISO local "YYYY-MM-DDTHH:MM"
+                            auto fmt_time = [](const char *iso) -> std::string {
+                              std::string s = iso ? iso : "";
+                              auto t = s.find('T');
+                              std::string hm = (t == std::string::npos) ? s : s.substr(t + 1, 5);
+                              int hh = atoi(hm.substr(0, 2).c_str());
+                              std::string mm = hm.substr(3, 2);
+                              const char *ap = (hh >= 12) ? "p" : "a";
+                              int h12 = hh % 12; if (h12 == 0) h12 = 12;
+                              char b[16]; snprintf(b, sizeof(b), "%d:%s%s", h12, mm.c_str(), ap);
+                              return std::string(b);
+                            };
+                            auto sr = daily["sunrise"];
+                            auto ss = daily["sunset"];
+                            if (!sr.isNull() && !ss.isNull()) {
+                              id(sun_rise).publish_state(fmt_time((const char*)sr[0]));
+                              id(sun_set).publish_state(fmt_time((const char*)ss[0]));
+                            }
                             auto tmax = daily["temperature_2m_max"];
                             auto tmin = daily["temperature_2m_min"];
                             auto dates = daily["time"];
@@ -338,6 +360,10 @@ display:
       } else {
         it.print(180, 140, id(font_big), Color::BLACK, TextAlign::TOP_LEFT, "--F");
       }
+      if (id(sun_rise).has_state() && id(sun_set).has_state()) {
+        it.printf(190, 256, id(font_mono), Color::BLACK, TextAlign::TOP_LEFT,
+          "^%s v%s", id(sun_rise).state.c_str(), id(sun_set).state.c_str());
+      } // e.g. ^6:58a v7:12p
       for (int x = 20; x < W - 20; x += 6) it.filled_circle(x, 280, 1, Color::BLACK);
       // Forecast row: fixed slots, icon 64px, temps BELOW icon with gap. No overlap by construction.
       // Row budget: badge 288-318, icon 324-388, temps 394, footer 440, indoor 444-478.
