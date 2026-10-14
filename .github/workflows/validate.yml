@@ -57,7 +57,7 @@ jobs:
           # CI has no real secrets.yaml; supply plausible dummies for validation only.
           # Never overwrite a real secrets file if one exists.
           if [ ! -f secrets.yaml ]; then
-            DUMMY_KEY=$(python3 -c "import base64; print(base64.b64encode(bytes(32)).decode())")
+            DUMMY_KEY=$(python3 -c "import base64, os; print(base64.b64encode(os.urandom(32)).decode())")
             cat > secrets.yaml <<EOF
           latitude: "37.7749"
           longitude: "-122.4194"
