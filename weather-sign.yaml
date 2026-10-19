@@ -30,6 +30,12 @@ web_server:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  # Keep the radio up: LIGHT power save (the ESPHome default) duty-cycles the
+  # WiFi modem, and the 7.5" ePaper refreshes block long enough for the AP to
+  # drop the association -> device falls offline until reboot.
+  power_save_mode: none
+  # Reassociate without a full channel scan after any drop.
+  fast_connect: true
   ap:
     ssid: aaa-broken-weather-sign
 captive_portal:
@@ -208,9 +214,11 @@ script:
                           if (!daily.isNull()) {
                             // daily["sunrise"][0] / ["sunset"][0] are ISO local "YYYY-MM-DDTHH:MM"
                             auto fmt_time = [](const char *iso) -> std::string {
-                              std::string s = iso ? iso : "";
+                              if (iso == nullptr || *iso == '\0') return "";
+                              std::string s = iso;
                               auto t = s.find('T');
                               std::string hm = (t == std::string::npos) ? s : s.substr(t + 1, 5);
+                              if (hm.size() < 5) return "";
                               int hh = atoi(hm.substr(0, 2).c_str());
                               std::string mm = hm.substr(3, 2);
                               const char *ap = (hh >= 12) ? "p" : "a";
@@ -221,32 +229,41 @@ script:
                             auto sr = daily["sunrise"];
                             auto ss = daily["sunset"];
                             if (!sr.isNull() && !ss.isNull()) {
-                              id(sun_rise).publish_state(fmt_time((const char*)sr[0]));
-                              id(sun_set).publish_state(fmt_time((const char*)ss[0]));
+                              auto sr_s = fmt_time(sr[0].as<const char *>());
+                              auto ss_s = fmt_time(ss[0].as<const char *>());
+                              if (!sr_s.empty()) id(sun_rise).publish_state(sr_s);
+                              if (!ss_s.empty()) id(sun_set).publish_state(ss_s);
                             }
                             auto tmax = daily["temperature_2m_max"];
                             auto tmin = daily["temperature_2m_min"];
                             auto dates = daily["time"];
                             auto dcodes = daily["weather_code"];
-                            const char *wdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-                            for (int i = 0; i < 3; i++) {
-                              std::string d = (const char*)dates[i+1];
-                              // d = YYYY-MM-DD -> weekday via Sakamoto
-                              int y = atoi(d.substr(0,4).c_str());
-                              int m = atoi(d.substr(5,2).c_str());
-                              int day = atoi(d.substr(8,2).c_str());
-                              int yy = y; static int t_[] = {0,3,2,5,0,3,5,1,4,6,2,4};
-                              if (m < 3) yy -= 1;
-                              int wd = (yy + yy/4 - yy/100 + yy/400 + t_[m-1] + day) % 7;
-                              int hi = (int)tmax[i+1].as<float>();
-                              int lo = (int)tmin[i+1].as<float>();
-                              int dc = dcodes[i+1].as<int>();
-                              char buf[32];
-                              snprintf(buf, sizeof(buf), "%s|%d|%d|%d", wdays[wd], hi, lo, dc);
-                              std::string s = buf;
-                              if (i == 0) id(fcst_1).publish_state(s);
-                              if (i == 1) id(fcst_2).publish_state(s);
-                              if (i == 2) id(fcst_3).publish_state(s);
+                            // Guard every array: a partial/odd API payload used to reach
+                            // std::string(nullptr) below and panic into a reboot loop.
+                            if (!dates.isNull() && !tmax.isNull() && !tmin.isNull() && !dcodes.isNull()) {
+                              const char *wdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+                              for (int i = 0; i < 3; i++) {
+                                const char *dstr = dates[i+1].as<const char *>();
+                                if (dstr == nullptr || strlen(dstr) < 10) continue;
+                                std::string d = dstr;
+                                // d = YYYY-MM-DD -> weekday via Sakamoto
+                                int y = atoi(d.substr(0,4).c_str());
+                                int m = atoi(d.substr(5,2).c_str());
+                                int day = atoi(d.substr(8,2).c_str());
+                                if (m < 1 || m > 12 || day < 1 || day > 31) continue;
+                                int yy = y; static const int t_[] = {0,3,2,5,0,3,5,1,4,6,2,4};
+                                if (m < 3) yy -= 1;
+                                int wd = (yy + yy/4 - yy/100 + yy/400 + t_[m-1] + day) % 7;
+                                int hi = (int)tmax[i+1].as<float>();
+                                int lo = (int)tmin[i+1].as<float>();
+                                int dc = dcodes[i+1].as<int>();
+                                char buf[32];
+                                snprintf(buf, sizeof(buf), "%s|%d|%d|%d", wdays[wd], hi, lo, dc);
+                                std::string s = buf;
+                                if (i == 0) id(fcst_1).publish_state(s);
+                                if (i == 1) id(fcst_2).publish_state(s);
+                                if (i == 2) id(fcst_3).publish_state(s);
+                              }
                             }
                           }
                           return true;
