@@ -50,15 +50,31 @@ web_server:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-  # Keep the radio up: LIGHT power save (the ESPHome default) duty-cycles the
-  # WiFi modem, and the 7.5" ePaper refreshes block long enough for the AP to
-  # drop the association -> device falls offline until reboot.
+  # NOTE (battery): `power_save_mode: none` keeps the radio in active mode the
+  # whole time. That is the single largest load on this battery device (tens of
+  # mA vs a few mA with modem sleep) and is the most likely reason the pack
+  # voltage "falls fast" overnight. It is kept here because the device was
+  # originally reported offline with the default LIGHT power save. If the drop
+  # is confirmed to be the battery dying (see the Last Reset Reason / Battery
+  # Level entities), the real fix is deep sleep between refreshes; the
+  # always-on alternative is to restore power_save_mode: light.
   power_save_mode: none
   # Reassociate without a full channel scan after any drop.
   fast_connect: true
+  # Cap TX power. Transmit peaks are the biggest instantaneous load and are what
+  # sag a weak cell into the brownout detector. With esp-idf, ESPHome also
+  # lowers the PHY max TX power to match, which prevents brownout during PHY
+  # init and OTA on a marginal supply. 13 dBm trades a little range for headroom
+  # (allowed 8.5-20.5 dBm; lower = more headroom, higher = more range).
+  output_power: 13dBm
   ap:
     ssid: aaa-broken-weather-sign
 captive_portal:
+
+debug:
+  # Publishes the previous reset reason once at boot (brownout vs power-on vs
+  # watchdog) as a Home Assistant entity; no periodic logging needed here.
+  update_interval: never
 
 i2c:
   sda: GPIO19
@@ -168,6 +184,11 @@ text_sensor:
     id: sun_rise
   - platform: template
     id: sun_set
+  # Why the device rebooted last time. "brownout" here confirms the low-voltage
+  # theory; "power-on event" with a low battery points at the pack dying.
+  - platform: debug
+    reset_reason:
+      name: Last Reset Reason
 
 sensor:
   - platform: template
@@ -196,7 +217,32 @@ sensor:
     attenuation: 12db
     update_interval: 60s
     filters:
+      # x2 undoes the on-board divider (VBAT_ADC is half the pack voltage).
+      # Median smooths WiFi-TX sag so a momentary dip does not read as a real
+      # "fast fall" on the Home Assistant graph.
       - multiply: 2.0
+      - median:
+          window_size: 5
+          send_every: 5
+  # No fuel-gauge IC is exposed in ESPHome on this board, so percentage is a
+  # linear fit of the crude ADC voltage (indicative, not coulomb-accurate):
+  # ~3.30 V = empty, ~4.15 V = full for a Li-ion cell.
+  - platform: template
+    id: batt_pct
+    name: Battery Level
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 60s
+    lambda: |-
+      const float v = id(batt_v).state;
+      if (isnan(v)) return NAN;
+      return (v - 3.30f) / (4.15f - 3.30f) * 100.0f;
+    filters:
+      - clamp:
+          min_value: 0
+          max_value: 100
 
 http_request:
   verify_ssl: false
@@ -205,6 +251,23 @@ json:
 
 script:
   - id: wx_fetch
+    then:
+      # Survive a sagging battery: below ~3.30 V skip the network round-trip
+      # (the CPU/TLS/radio burst) and hold the last image rather than adding a
+      # current spike that can trip the brownout detector. The panel's own
+      # update_interval still runs, so the display is never frozen.
+      - if:
+          condition:
+            lambda: return !isnan(id(batt_v).state) && id(batt_v).state < 3.30f;
+          then:
+            - logger.log:
+                level: WARN
+                format: "Battery low (%.2f V): skipping weather fetch"
+                args: ['id(batt_v).state']
+          else:
+            - script.execute: wx_do_fetch
+  # Split out so wx_fetch can skip the fetch entirely when the battery is low.
+  - id: wx_do_fetch
     then:
       - http_request.get:
           url: https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,is_day&daily=temperature_2m_max,temperature_2m_min,weather_code,sunrise,sunset&timezone=auto&forecast_days=4&temperature_unit=fahrenheit&wind_speed_unit=mph
