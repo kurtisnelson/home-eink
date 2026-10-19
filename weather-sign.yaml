@@ -8,9 +8,22 @@ esphome:
   name: ${name}
   friendly_name: ${friendly_name}
   on_boot:
-    priority: 600
-    then:
-      - output.turn_on: battery_enable
+    # 600: bring the status LED up before WiFi/display come online. If the board
+    # ever crashes or reboot-loops before it can draw, the LED simply stays on,
+    # which makes a failed boot obvious on the bench.
+    - priority: 600
+      then:
+        - output.turn_on: battery_enable
+        - output.turn_on: status_led
+    # -100 runs after every component is set up. The e-paper driver is a
+    # non-blocking state machine and ESPHome exposes no "refresh complete"
+    # trigger (component.update returns immediately), so hold the LED through
+    # the first refresh and then switch it off after a full 800x480 refresh
+    # comfortably completes.
+    - priority: -100
+      then:
+        - delay: 30s
+        - output.turn_off: status_led
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -18,6 +31,13 @@ esp32:
     type: esp-idf
 
 logger:
+  # Keep the default DEBUG level on purpose. An overnight drop is only
+  # diagnosable if its cause is in the logs: the boot banner carries the reset
+  # reason (rst:0x... e.g. BROWNOUT / RTCWDT / TG0WDT) and the wifi component
+  # logs disconnect reason codes. ESPHome does not allow a per-component level
+  # to be more verbose than the global one, so a quieter global level (INFO)
+  # would hide the wifi association story we need.
+  level: DEBUG
 api:
   encryption:
     key: !secret weather_sign__encryption_key
@@ -51,6 +71,14 @@ output:
   - platform: gpio
     pin: GPIO21
     id: battery_enable
+  # Onboard status LED. Seeed's reTerminal E-series ESPHome cookbook lists the
+  # E1001/E1002 onboard LED on GPIO6, active-low (inverted: true). The panel
+  # itself uses CS/DC/RST/BUSY = GPIO10/11/12/13, so GPIO6 is free.
+  - platform: gpio
+    pin:
+      number: GPIO6
+      inverted: true
+    id: status_led
 
 time:
   - platform: sntp
