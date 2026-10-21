@@ -5,44 +5,65 @@ on:
     paths:
       - '**/*.yml'
       - '**/*.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ESPHOME_VERSION: '2026.10.0'
 
 jobs:
-  device-builder:
+  # The device builder only supports a *single* YAML config per instance, so
+  # each variant gets its own matrix job: one staged config in, one set of
+  # firmware artifacts out. Both power modes are built every run.
+  firmware:
+    name: ${{ matrix.variant }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: always-on
+            config: weather-sign.yaml
+            node: weather-sign
+          - variant: sleep
+            config: weather-sign-sleep.yaml
+            node: weather-sign-sleep
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
+          # ESPHome 2026.10 requires Python >= 3.12 and knows the
+          # Seeed-reTerminal-E1001 display model used here.
           python-version: '3.13'
 
       - name: Install esphome-device-builder
-        run: pip install 'esphome-device-builder[esphome]'
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'esphome-device-builder[esphome]'
+          # Pin the compiler to the same release the device runs, so the
+          # artifacts match what the device expects.
+          pip install "esphome==${ESPHOME_VERSION}"
+          esphome version
 
-      - name: Stage configs dir
+      - name: Stage a single config for the builder
         run: |
           set -euo pipefail
-          mkdir -p configs
-          # Repo keeps device YAMLs at the root (e.g. weather-sign.yaml);
-          # stage them into ./configs so the builder has a config dir.
-          for f in *.yaml *.yml; do
-            [ -f "$f" ] || continue
-            # Don't copy a root secrets file into the staged dir blindly;
-            # it is handled below (dummy only if missing).
-            [ "$f" = "secrets.yaml" ] && continue
-            cp "$f" configs/
-          done
+          rm -rf build
+          mkdir -p build
+          # Exactly one device YAML per job - the builder cannot load a
+          # directory of competing configs.
+          cp "${{ matrix.config }}" build/
           # The device YAMLs pull in a shared package with
           # `!include packages/...`, so the package tree has to be staged
           # next to them for the include to resolve.
-          if [ -d packages ]; then
-            cp -r packages configs/
-          fi
-          ls -la configs
-          # CI has no real secrets.yaml; supply plausible dummies for validation only.
-          if [ ! -f configs/secrets.yaml ] && [ ! -f secrets.yaml ]; then
-            DUMMY_KEY=$(python3 -c "import base64, os; print(base64.b64encode(os.urandom(32)).decode())")
-            cat > configs/secrets.yaml <<EOF
+          cp -r packages build/
+          # CI has no real secrets.yaml; supply plausible dummies for
+          # validation and compilation only.
+          DUMMY_KEY=$(python3 -c "import base64, os; print(base64.b64encode(os.urandom(32)).decode())")
+          cat > build/secrets.yaml <<EOF
           latitude: "37.7749"
           longitude: "-122.4194"
           weather_sign__encryption_key: "$DUMMY_KEY"
@@ -50,12 +71,15 @@ jobs:
           wifi_ssid: "dummy-ssid"
           wifi_password: "dummy-password"
           EOF
-          fi
+          ls -la build
+
+      - name: Validate the staged config
+        run: esphome config "build/${{ matrix.config }}"
 
       - name: Run esphome-device-builder
         run: |
           set -euo pipefail
-          esphome-device-builder ./configs --log-level debug --dev > builder.log 2>&1 &
+          esphome-device-builder ./build --log-level debug --dev > builder.log 2>&1 &
           BUILDER_PID=$!
           # Wait up to ~60s for the dashboard to serve its health endpoint.
           for i in $(seq 1 60); do
@@ -63,7 +87,7 @@ jobs:
               echo "device-builder is up (after ~${i}s)"
               curl -fsS http://localhost:6052/version
               echo
-              kill "$BUILDER_PID"
+              kill "$BUILDER_PID" || true
               wait "$BUILDER_PID" || true
               exit 0
             fi
@@ -78,3 +102,68 @@ jobs:
           cat builder.log
           kill "$BUILDER_PID" || true
           exit 1
+
+      - name: Build the firmware
+        run: esphome compile "build/${{ matrix.config }}"
+
+      - name: Collect the artifacts
+        run: |
+          set -euo pipefail
+          BUILD_DIR="build/.esphome/build/${{ matrix.node }}/build"
+          rm -rf artifact
+          mkdir -p artifact
+          cp "$BUILD_DIR/firmware.factory.bin" artifact/
+          cp "$BUILD_DIR/firmware.ota.bin" artifact/
+          cp "$BUILD_DIR/flasher_args.json" artifact/
+          cp "$BUILD_DIR/bootloader/bootloader.bin" artifact/
+          cp "$BUILD_DIR/partition_table/partition-table.bin" artifact/
+          cp "$BUILD_DIR/ota_data_initial.bin" artifact/
+          # Ship the config that produced the binary, so the artifact can be
+          # rebuilt or re-flashed on its own.
+          cp "build/${{ matrix.config }}" artifact/
+          cp build/packages/weather-sign-common.yaml artifact/
+          python3 - <<'PY' > artifact/manifest.txt
+          import json, os, hashlib
+          node = "${{ matrix.node }}"
+          args = json.load(open("artifact/flasher_args.json"))
+          chip = args["extra_esptool_args"]["chip"]
+          # Map the build tree's flash files onto the flat artifact layout.
+          sections = []
+          for offset, source in sorted(args["flash_files"].items(), key=lambda kv: int(kv[0], 16)):
+              name = "firmware.ota.bin" if os.path.basename(source) == node + ".bin" else os.path.basename(source)
+              sections.append((offset, name))
+          print("variant: ${{ matrix.variant }}")
+          print("node: " + node)
+          print("config: ${{ matrix.config }}")
+          print("esphome: ${ESPHOME_VERSION}")
+          print("framework: esp-idf")
+          print()
+          print("files:")
+          for name in sorted(os.listdir("artifact")):
+              path = os.path.join("artifact", name)
+              if not os.path.isfile(path) or name == "manifest.txt":
+                  continue
+              digest = hashlib.sha256(open(path, "rb").read()).hexdigest()
+              print(f"  {name}  {os.path.getsize(path)} bytes  sha256={digest}")
+          print()
+          print("flash the merged factory image (bootloader + partition table + app):")
+          print(f"  esptool.py --chip {chip} write_flash 0x0 firmware.factory.bin")
+          print()
+          print("flash the pieces one by one:")
+          print(f"  esptool.py --chip {chip} write_flash \\")
+          for offset, name in sections:
+              print(f"    {offset} {name} \\")
+          print()
+          print("update over the air:")
+          print("  esphome run ${{ matrix.config }} --device <your-device-ip>")
+          PY
+          cat artifact/manifest.txt
+          ls -la artifact
+
+      - name: Upload the firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.variant }}
+          if-no-files-found: error
+          retention-days: 14
+          path: artifact/
