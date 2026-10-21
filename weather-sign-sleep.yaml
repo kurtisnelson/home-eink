@@ -1,0 +1,232 @@
+# reTerminal E1001 weather sign - DEEP SLEEP build.
+#
+# Same hardware, same panel, same weather pipeline as weather-sign.yaml (they
+# share packages/weather-sign-common.yaml) - but the radio is powered down
+# between refreshes instead of running forever.
+#
+# How a cycle works:
+#   1. The ESP32 wakes from deep sleep (timer, or the GPIO3 button).
+#   2. WiFi comes up, the clock syncs, Open-Meteo is polled.
+#   3. The e-paper panel is redrawn with the new numbers.
+#   4. The device goes back to sleep until the next cycle.
+#
+# What this buys you (2000 mAh pack, 1h refresh, 75 s awake window):
+#   always on : the WiFi radio alone is tens of mA, so the pack lasts hours.
+#   sleep     : ~25 mAh/day, so roughly 2-3 months per charge.
+# The awake window dominates the budget, not the sleep interval - see the
+# PR description for the full arithmetic and the knobs to turn.
+#
+# Trade-offs, in the open:
+#   * Home Assistant sees this as a *separate device* (the node name has to
+#     differ from the always-on build, ESPHome refuses two nodes with one
+#     name) and it is offline/unavailable while it sleeps, which is most of
+#     the time. Entity values are the last known ones.
+#   * The battery level is only measured while the device is awake, so the
+#     Home Assistant battery graph is a step function, not a smooth line.
+#   * The "Sleep Mode" switch can only be flipped while the device is awake.
+#     Press the button first: that wakes the sign and holds it awake for
+#     ${awake_minutes} minutes.
+#   * Each wake is a full boot: ~3-5 s before anything happens on the panel.
+
+substitutions:
+  name: weather-sign-sleep
+  friendly_name: Weather Sign (Sleep)
+  latitude: !secret latitude
+  longitude: !secret longitude
+  # (battery) none keeps the radio in active mode. It only matters for the
+  # short awake window here, so the saving is small - but "none" is the most
+  # reliable setting and the one this device was reported offline with when it
+  # was LIGHT.
+  wifi_power_save_mode: none
+  # How often the forecast is refetched *while the device stays awake* (sleep
+  # mode off, or during an extended awake window). In sleep mode the refresh
+  # cadence is set by sleep_interval below.
+  weather_fetch_interval: 30min
+  # How long the device stays asleep between refreshes.
+  sleep_interval: 1h
+  # How long the device stays awake after a wake-up before it is allowed to
+  # sleep again. It has to cover: WiFi association (~5 s) + NTP sync (<=10 s)
+  # + the HTTP round trip (~3 s) + the 5 s radio/panel separation + the
+  # e-paper refresh (up to ~30 s). Raise it if the panel is sometimes caught
+  # mid-refresh, lower it to save battery.
+  awake_seconds: 75s
+  # How long a button press keeps the device awake and connected, so there is
+  # time to change the "Sleep Mode" switch in Home Assistant.
+  awake_minutes: 5
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    # 600: bring the status LED up before WiFi/display come online. If the board
+    # ever crashes or reboot-loops before it can draw, the LED simply stays on,
+    # which makes a failed boot obvious on the bench.
+    - priority: 600
+      then:
+        - output.turn_on: battery_enable
+        - output.turn_on: status_led
+    # -100 runs after every component is set up. The e-paper driver is a
+    # non-blocking state machine and ESPHome exposes no "refresh complete"
+    # trigger (component.update returns immediately), so hold the LED through
+    # the first refresh and then switch it off after a full 800x480 refresh
+    # comfortably completes.
+    - priority: -100
+      then:
+        - delay: 30s
+        - output.turn_off: status_led
+  on_shutdown:
+    # Runs right before the ESP32 powers down, so the LED is off for the whole
+    # sleep period instead of glowing into the room all night.
+    - output.turn_off: status_led
+
+logger:
+  # INFO is enough here: the useful lines are the wake reason, the fetch
+  # result and the reset reason (also published as "Last Reset Reason").
+  # DEBUG is one line away if you are chasing something specific.
+  level: INFO
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: America/Los_Angeles
+    servers:
+      - pool.ntp.org
+    # NOTE: no on_time_sync -> component.update here. That would redraw the
+    # panel the moment the clock syncs - before the weather fetch has filled
+    # in any data - and burn a full e-paper refresh on a blank panel. The
+    # refresh below is triggered by the fetch instead.
+
+deep_sleep:
+  id: deep_sleep_ctrl
+  sleep_duration: ${sleep_interval}
+  # The same GPIO3 button that triggers a manual refresh in the always-on
+  # build also wakes the device here. It is active-low with a pull-up, which
+  # is why the pin is inverted: ESPHome wakes on a LOW level, i.e. on a
+  # press. The pull-up is kept alive by the ESP32 during deep sleep, so the
+  # button works without any external resistor.
+  wakeup_pin:
+    - pin:
+        number: GPIO3
+        inverted: true
+        mode: INPUT_PULLUP
+        # Same physical button as the binary_sensor below: waking the device
+        # and refreshing it are deliberately the same GPIO.
+        allow_other_uses: true
+  # Do not go to sleep while the button is still held down, otherwise a stuck
+  # or sticky button would wake the device straight back up over and over.
+  wakeup_pin_mode: KEEP_AWAKE
+  on_wake:
+    then:
+      # A button wake means somebody is standing in front of the sign: keep
+      # the radio up for a few minutes so the panel refreshes *and* the
+      # Home Assistant entities are reachable.
+      - if:
+          condition:
+            lambda: return cause == deep_sleep::WAKEUP_CAUSE_GPIO;
+          then:
+            - lambda: |-
+                id(awake_until) = millis() + ${awake_minutes} * 60UL * 1000UL;
+            - logger.log:
+                level: INFO
+                format: "Woken by the button - staying awake for ${awake_minutes} minutes"
+
+globals:
+  # Deadline (millis) until which the device must stay awake because the
+  # button woke it. Not restored: after a deep sleep the device starts from 0.
+  - id: awake_until
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+switch:
+  # Persisted in flash, so the choice survives the deep-sleep reboots.
+  - platform: template
+    id: sleep_mode
+    name: "Sleep Mode"
+    icon: "mdi:power-sleep"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - logger.log:
+          level: INFO
+          format: "Sleep mode on - the sign sleeps between refreshes"
+    turn_off_action:
+      - logger.log:
+          level: INFO
+          format: "Sleep mode off - the sign stays awake and connected"
+
+script:
+  # Called when the WiFi comes up. Waits for the clock (the panel header
+  # shows the date) and then pulls the forecast. The clock wait is bounded so
+  # a broken NTP server cannot stop the panel from updating.
+  - id: wake_fetch
+    then:
+      - wait_until:
+          condition:
+            lambda: return id(sntp_time).now().is_valid();
+          timeout: 10s
+      - script.execute: wx_fetch
+  # Decides whether the device may go back to sleep.
+  - id: sleep_check
+    then:
+      - if:
+          condition:
+            lambda: |-
+              // 1. Never sleep while the user has turned sleep mode off.
+              if (!id(sleep_mode).state) return false;
+              // 2. Never sleep inside the window a button press opened.
+              //    Signed difference so the millis() wrap-around is safe.
+              if ((int32_t) (millis() - id(awake_until)) < 0) return false;
+              return true;
+          then:
+            - logger.log:
+                level: INFO
+                format: "Going to sleep for ${sleep_interval}"
+            - deep_sleep.enter:
+                sleep_duration: ${sleep_interval}
+
+interval:
+  # The sleep check. The first run is ${awake_seconds} after boot, i.e. after
+  # the fetch and the panel refresh have had time to finish; afterwards it
+  # repeats every 30 s so a button wake can be noticed.
+  - interval: 30s
+    startup_delay: ${awake_seconds}
+    then:
+      - script.execute: sleep_check
+  # Keeps the forecast fresh while the device stays awake (sleep mode off, or
+  # during a long awake window). In sleep mode this rarely fires because the
+  # device is asleep for most of the hour.
+  - interval: ${weather_fetch_interval}
+    startup_delay: 5min
+    then:
+      - script.execute: wx_fetch
+
+wifi:
+  # The WiFi is the trigger for a refresh in this build: the panel is redrawn
+  # as soon as the radio is up, which is also when the clock and the forecast
+  # become reachable.
+  on_connect:
+    then:
+      - script.execute: wake_fetch
+
+binary_sensor:
+  # The button on the back of the sign. In this build GPIO3 is also the
+  # deep-sleep wake pin, which ESPHome normally rejects ("pin used in
+  # multiple places"); allow_other_uses says that both uses are deliberate.
+  # The wake path is handled by deep_sleep below - this binary sensor only
+  # covers a press while the device is already awake, which triggers a
+  # refresh.
+  - platform: gpio
+    pin:
+      number: GPIO3
+      inverted: true
+      mode: INPUT_PULLUP
+      allow_other_uses: true
+    id: btn_refresh
+    internal: true
+    on_press:
+      then:
+        - script.execute: wx_fetch
+
+packages:
+  common: !include packages/weather-sign-common.yaml

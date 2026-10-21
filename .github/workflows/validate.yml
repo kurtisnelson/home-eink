@@ -68,3 +68,4 @@ jobs:
           EOF
           fi
           esphome config weather-sign.yaml
+          esphome config weather-sign-sleep.yaml

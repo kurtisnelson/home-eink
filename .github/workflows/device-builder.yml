@@ -32,6 +32,12 @@ jobs:
             [ "$f" = "secrets.yaml" ] && continue
             cp "$f" configs/
           done
+          # The device YAMLs pull in a shared package with
+          # `!include packages/...`, so the package tree has to be staged
+          # next to them for the include to resolve.
+          if [ -d packages ]; then
+            cp -r packages configs/
+          fi
           ls -la configs
           # CI has no real secrets.yaml; supply plausible dummies for validation only.
           if [ ! -f configs/secrets.yaml ] && [ ! -f secrets.yaml ]; then
