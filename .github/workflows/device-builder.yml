@@ -135,7 +135,7 @@ jobs:
           print("variant: ${{ matrix.variant }}")
           print("node: " + node)
           print("config: ${{ matrix.config }}")
-          print("esphome: ${ESPHOME_VERSION}")
+          print("esphome: " + os.environ.get("ESPHOME_VERSION", "unknown"))
           print("framework: esp-idf")
           print()
           print("files:")
