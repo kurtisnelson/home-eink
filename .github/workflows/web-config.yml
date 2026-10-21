@@ -1,0 +1,100 @@
+name: ESPHome Web Config
+
+on:
+  pull_request:
+    paths:
+      - '**/*.yml'
+      - '**/*.yaml'
+      - '**/*.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ESPHOME_VERSION: '2026.10.0'
+
+jobs:
+  # One merged YAML per power mode, ready to paste into the ESPHome web app
+  # (the Device Builder). No firmware is compiled here - the web app does
+  # that in the browser, and the user may want to tweak the config first.
+  merged-config:
+    name: ${{ matrix.variant }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: always-on
+            config: weather-sign.yaml
+          - variant: sleep
+            config: weather-sign-sleep.yaml
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # ESPHome 2026.10 requires Python >= 3.12.
+          python-version: '3.13'
+
+      - name: Install ESPHome
+        run: |
+          python -m pip install --upgrade pip
+          pip install "esphome==${ESPHOME_VERSION}"
+          esphome version
+
+      - name: Stage the config and a dummy secrets file
+        run: |
+          set -euo pipefail
+          rm -rf build out
+          mkdir -p build out
+          cp "${{ matrix.config }}" build/
+          # The device YAMLs pull in a shared package with
+          # `!include packages/...`, so the package tree has to be staged
+          # next to them for the include to resolve.
+          cp -r packages build/
+          # CI has no real secrets.yaml; supply plausible dummies. They are
+          # only needed so the loader can resolve the !secret references -
+          # they never reach the merged output, which keeps the references.
+          DUMMY_KEY=$(python3 -c "import base64, os; print(base64.b64encode(os.urandom(32)).decode())")
+          cat > build/secrets.yaml <<EOF
+          latitude: "37.7749"
+          longitude: "-122.4194"
+          weather_sign__encryption_key: "$DUMMY_KEY"
+          weather_sign__ota_password: "dummy-ota-password"
+          wifi_ssid: "dummy-ssid"
+          wifi_password: "dummy-password"
+          EOF
+
+      - name: Merge the config into one file
+        run: |
+          set -euo pipefail
+          python scripts/merge_config.py \
+            "build/${{ matrix.config }}" \
+            -o "out/${{ matrix.config }}"
+          echo "--- merged ${{ matrix.config }} ---"
+          head -20 "out/${{ matrix.config }}"
+
+      - name: Validate the merged file on its own
+        run: |
+          set -euo pipefail
+          # The merged file has to be a working config by itself: no
+          # !include, no packages block, nothing left to resolve but the
+          # secrets the user brings.
+          if grep -qE '^[[:space:]]*!include|^packages:' "out/${{ matrix.config }}"; then
+            echo "::error::merged config still contains an include or a packages block"
+            exit 1
+          fi
+          rm -rf check
+          mkdir -p check
+          cp "out/${{ matrix.config }}" check/
+          cp build/secrets.yaml check/
+          esphome config "check/${{ matrix.config }}"
+
+      - name: Upload the merged config
+        uses: actions/upload-artifact@v4
+        with:
+          name: weather-sign-${{ matrix.variant }}
+          if-no-files-found: error
+          retention-days: 14
+          path: out/${{ matrix.config }}

@@ -1,2 +1,5 @@
 # ESPHome secrets (real device credentials — never commit)
 secrets.yaml
+
+# ESPHome build artifacts (never commit)
+.esphome/

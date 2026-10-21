@@ -1,8 +1,37 @@
+# reTerminal E1001 weather sign - ALWAYS ON build.
+#
+# This is the "connected" build: the radio stays up, Home Assistant stays
+# connected, the panel refreshes itself every 15 minutes and the forecast is
+# refetched on a timer.
+#
+# Battery notes for this build:
+#   * The radio is the whole budget. With `wifi_power_save_mode: none` the
+#     ESP32-S3 keeps its WiFi in active mode continuously, which is tens of
+#     mA. Everything else on this board (e-paper, SHT40, ADC) is noise next to
+#     that. A 2000 mAh pack therefore lasts hours-to-a-day here, not weeks.
+#   * The real fix for runtime is the sibling build, weather-sign-sleep.yaml,
+#     which sleeps between refreshes. Switch the "Sleep Mode" switch off in
+#     Home Assistant to keep this always-on behaviour on the sleep hardware.
+#
+# See packages/weather-sign-common.yaml for everything both builds share.
+
 substitutions:
   name: weather-sign
   friendly_name: Weather Sign
   latitude: !secret latitude
   longitude: !secret longitude
+  # (battery) none keeps the radio in active mode all the time - the most
+  # reliable setting, and the one this device was reported offline with when
+  # it was LIGHT. light drops the radio into modem sleep between beacons and
+  # is the single biggest saving available to the always-on build (tens of mA
+  # down to a few mA), at the cost of a higher chance of dropped packets /
+  # slow reconnection on a weak signal. Try it with a spare battery first;
+  # switching it back is a one-line change.
+  wifi_power_save_mode: none
+  # How often the forecast is refetched. 30min is a good balance; the panel
+  # itself still redraws every 15min (see the display update_interval in the
+  # package) so the clock on the sign stays fresh.
+  weather_fetch_interval: 30min
 
 esphome:
   name: ${name}
@@ -25,76 +54,14 @@ esphome:
         - delay: 30s
         - output.turn_off: status_led
 
-esp32:
-  board: esp32-s3-devkitc-1
-  framework:
-    type: esp-idf
-
 logger:
-  # Keep the default DEBUG level on purpose. An overnight drop is only
-  # diagnosable if its cause is in the logs: the boot banner carries the reset
-  # reason (rst:0x... e.g. BROWNOUT / RTCWDT / TG0WDT) and the wifi component
-  # logs disconnect reason codes. ESPHome does not allow a per-component level
-  # to be more verbose than the global one, so a quieter global level (INFO)
-  # would hide the wifi association story we need.
-  level: DEBUG
-api:
-  encryption:
-    key: !secret weather_sign__encryption_key
-ota:
-  - platform: esphome
-    password: !secret weather_sign__ota_password
-web_server:
-  port: 80
-
-wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
-  # NOTE (battery): `power_save_mode: none` keeps the radio in active mode the
-  # whole time. That is the single largest load on this battery device (tens of
-  # mA vs a few mA with modem sleep) and is the most likely reason the pack
-  # voltage "falls fast" overnight. It is kept here because the device was
-  # originally reported offline with the default LIGHT power save. If the drop
-  # is confirmed to be the battery dying (see the Last Reset Reason / Battery
-  # Level entities), the real fix is deep sleep between refreshes; the
-  # always-on alternative is to restore power_save_mode: light.
-  power_save_mode: none
-  # Reassociate without a full channel scan after any drop.
-  fast_connect: true
-  # Cap TX power. Transmit peaks are the biggest instantaneous load and are what
-  # sag a weak cell into the brownout detector. With esp-idf, ESPHome also
-  # lowers the PHY max TX power to match, which prevents brownout during PHY
-  # init and OTA on a marginal supply. 13 dBm trades a little range for headroom
-  # (allowed 8.5-20.5 dBm; lower = more headroom, higher = more range).
-  output_power: 13dBm
-  ap:
-    ssid: aaa-broken-weather-sign
-captive_portal:
-
-debug:
-  # Publishes the previous reset reason once at boot (brownout vs power-on vs
-  # watchdog) as a Home Assistant entity; no periodic logging needed here.
-  update_interval: never
-
-i2c:
-  sda: GPIO19
-  scl: GPIO20
-spi:
-  clk_pin: GPIO7
-  mosi_pin: GPIO9
-
-output:
-  - platform: gpio
-    pin: GPIO21
-    id: battery_enable
-  # Onboard status LED. Seeed's reTerminal E-series ESPHome cookbook lists the
-  # E1001/E1002 onboard LED on GPIO6, active-low (inverted: true). The panel
-  # itself uses CS/DC/RST/BUSY = GPIO10/11/12/13, so GPIO6 is free.
-  - platform: gpio
-    pin:
-      number: GPIO6
-      inverted: true
-    id: status_led
+  # INFO is enough to follow the device day to day. The one thing that really
+  # matters for an overnight failure - the reset reason (rst:0x... e.g.
+  # BROWNOUT / RTCWDT / TG0WDT) - is printed by the ROM boot banner and is
+  # also published as the "Last Reset Reason" entity, so dropping DEBUG here
+  # does not lose the diagnosis. Set it back to DEBUG if you are chasing
+  # something specific (it costs a little UART traffic and CPU time).
+  level: INFO
 
 time:
   - platform: sntp
@@ -106,268 +73,15 @@ time:
       then:
         - component.update: epaper
 
-font:
-  - file: "gfonts://Inter"
-    id: font_small
-    size: 24
-  - file: "gfonts://Inter@600"
-    id: font_med
-    size: 36
-  - file: "gfonts://Inter@700"
-    id: font_big
-    size: 72
-  - file: "gfonts://JetBrains Mono"
-    id: font_mono
-    size: 24
-
-image:
-  - platform: file
-    defaults:
-      type: BINARY
-      transparency: chroma_key
-      resize: 64x64
-    files:
-      - file: mdi:weather-sunny
-        id: icon_sunny
-      - file: mdi:weather-night
-        id: icon_clear_night
-      - file: mdi:weather-partly-cloudy
-        id: icon_partly
-      - file: mdi:weather-cloudy
-        id: icon_cloudy
-      - file: mdi:weather-fog
-        id: icon_fog
-      - file: mdi:weather-pouring
-        id: icon_rain
-      - file: mdi:weather-lightning-rainy
-        id: icon_storm
-      - file: mdi:weather-snowy
-        id: icon_snow
-      - file: mdi:weather-windy
-        id: icon_wind
-# Hero (current-condition) icons, large to match 72pt temperature
-  - platform: file
-    defaults:
-      type: BINARY
-      transparency: chroma_key
-      resize: 140x140
-    files:
-      - file: mdi:weather-sunny
-        id: hero_sunny
-      - file: mdi:weather-night
-        id: hero_clear_night
-      - file: mdi:weather-partly-cloudy
-        id: hero_partly
-      - file: mdi:weather-cloudy
-        id: hero_cloudy
-      - file: mdi:weather-fog
-        id: hero_fog
-      - file: mdi:weather-pouring
-        id: hero_rain
-      - file: mdi:weather-lightning-rainy
-        id: hero_storm
-      - file: mdi:weather-snowy
-        id: hero_snow
-
-# All weather state lives on-device, filled by Open-Meteo fetch below.
-# Only Room Temp/Humidity + Battery are named => only those go to HA.
-text_sensor:
-  - platform: template
-    id: wx_condition
-  - platform: template
-    id: fcst_1
-  - platform: template
-    id: fcst_2
-  - platform: template
-    id: fcst_3
-  - platform: template
-    id: sun_rise
-  - platform: template
-    id: sun_set
-  # Why the device rebooted last time. "brownout" here confirms the low-voltage
-  # theory; "power-on event" with a low battery points at the pack dying.
-  - platform: debug
-    reset_reason:
-      name: Last Reset Reason
-
-sensor:
-  - platform: template
-    id: wx_temp
-    unit_of_measurement: °F
-  - platform: template
-    id: wx_humidity
-    unit_of_measurement: "%"
-  - platform: template
-    id: wx_wind
-    unit_of_measurement: mph
-  - platform: template
-    id: wx_code
-  - platform: sht4x
-    address: 0x44
-    temperature:
-      name: Room Temperature
-      id: room_temp
-    humidity:
-      name: Room Humidity
-      id: room_hum
-  - platform: adc
-    pin: GPIO1
-    id: batt_v
-    name: Battery Voltage
-    attenuation: 12db
-    update_interval: 60s
-    filters:
-      # x2 undoes the on-board divider (VBAT_ADC is half the pack voltage).
-      # Median smooths WiFi-TX sag so a momentary dip does not read as a real
-      # "fast fall" on the Home Assistant graph.
-      - multiply: 2.0
-      - median:
-          window_size: 5
-          send_every: 5
-  # No fuel-gauge IC is exposed in ESPHome on this board, so percentage is a
-  # linear fit of the crude ADC voltage (indicative, not coulomb-accurate):
-  # ~3.30 V = empty, ~4.15 V = full for a Li-ion cell.
-  - platform: template
-    id: batt_pct
-    name: Battery Level
-    unit_of_measurement: "%"
-    device_class: battery
-    state_class: measurement
-    accuracy_decimals: 0
-    update_interval: 60s
-    lambda: |-
-      const float v = id(batt_v).state;
-      if (isnan(v)) return NAN;
-      return (v - 3.30f) / (4.15f - 3.30f) * 100.0f;
-    filters:
-      - clamp:
-          min_value: 0
-          max_value: 100
-
-http_request:
-  verify_ssl: false
-  timeout: 15s
-json:
-
-script:
-  - id: wx_fetch
-    then:
-      # Survive a sagging battery: below ~3.30 V skip the network round-trip
-      # (the CPU/TLS/radio burst) and hold the last image rather than adding a
-      # current spike that can trip the brownout detector. The panel's own
-      # update_interval still runs, so the display is never frozen.
-      - if:
-          condition:
-            lambda: return !isnan(id(batt_v).state) && id(batt_v).state < 3.30f;
-          then:
-            - logger.log:
-                level: WARN
-                format: "Battery low (%.2f V): skipping weather fetch"
-                args: ['id(batt_v).state']
-          else:
-            - script.execute: wx_do_fetch
-  # Split out so wx_fetch can skip the fetch entirely when the battery is low.
-  - id: wx_do_fetch
-    then:
-      - http_request.get:
-          url: https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,is_day&daily=temperature_2m_max,temperature_2m_min,weather_code,sunrise,sunset&timezone=auto&forecast_days=4&temperature_unit=fahrenheit&wind_speed_unit=mph
-          capture_response: true
-          max_response_buffer_size: 4096
-          on_response:
-            then:
-              - if:
-                  condition:
-                    lambda: return response->status_code == 200;
-                  then:
-                    - lambda: |-
-                        json::parse_json(body, [](JsonObject root) -> bool {
-                          auto cur = root["current"];
-                          if (!cur.isNull()) {
-                            id(wx_temp).publish_state(cur["temperature_2m"].as<float>());
-                            id(wx_humidity).publish_state(cur["relative_humidity_2m"].as<float>());
-                            id(wx_wind).publish_state(cur["wind_speed_10m"].as<float>());
-                            int code = cur["weather_code"].as<int>();
-                            int is_day = cur["is_day"].as<int>();
-                            id(wx_code).publish_state((float)code);
-                            // WMO weather-code -> short label
-                            std::string label = "cloudy";
-                            if (code == 0) label = (is_day ? "sunny" : "clear-night");
-                            else if (code <= 3) label = (code == 1 ? "partlycloudy" : "cloudy");
-                            else if (code <= 48) label = "fog";
-                            else if (code <= 67) label = "rainy";
-                            else if (code <= 77) label = "snowy";
-                            else if (code <= 82) label = "rainy";
-                            else if (code <= 86) label = "snowy";
-                            else if (code <= 99) label = "storm";
-                            id(wx_condition).publish_state(label);
-                          }
-                          auto daily = root["daily"];
-                          if (!daily.isNull()) {
-                            // daily["sunrise"][0] / ["sunset"][0] are ISO local "YYYY-MM-DDTHH:MM"
-                            auto fmt_time = [](const char *iso) -> std::string {
-                              if (iso == nullptr || *iso == '\0') return "";
-                              std::string s = iso;
-                              auto t = s.find('T');
-                              std::string hm = (t == std::string::npos) ? s : s.substr(t + 1, 5);
-                              if (hm.size() < 5) return "";
-                              int hh = atoi(hm.substr(0, 2).c_str());
-                              std::string mm = hm.substr(3, 2);
-                              const char *ap = (hh >= 12) ? "p" : "a";
-                              int h12 = hh % 12; if (h12 == 0) h12 = 12;
-                              char b[16]; snprintf(b, sizeof(b), "%d:%s%s", h12, mm.c_str(), ap);
-                              return std::string(b);
-                            };
-                            auto sr = daily["sunrise"];
-                            auto ss = daily["sunset"];
-                            if (!sr.isNull() && !ss.isNull()) {
-                              auto sr_s = fmt_time(sr[0].as<const char *>());
-                              auto ss_s = fmt_time(ss[0].as<const char *>());
-                              if (!sr_s.empty()) id(sun_rise).publish_state(sr_s);
-                              if (!ss_s.empty()) id(sun_set).publish_state(ss_s);
-                            }
-                            auto tmax = daily["temperature_2m_max"];
-                            auto tmin = daily["temperature_2m_min"];
-                            auto dates = daily["time"];
-                            auto dcodes = daily["weather_code"];
-                            // Guard every array: a partial/odd API payload used to reach
-                            // std::string(nullptr) below and panic into a reboot loop.
-                            if (!dates.isNull() && !tmax.isNull() && !tmin.isNull() && !dcodes.isNull()) {
-                              const char *wdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-                              for (int i = 0; i < 3; i++) {
-                                const char *dstr = dates[i+1].as<const char *>();
-                                if (dstr == nullptr || strlen(dstr) < 10) continue;
-                                std::string d = dstr;
-                                // d = YYYY-MM-DD -> weekday via Sakamoto
-                                int y = atoi(d.substr(0,4).c_str());
-                                int m = atoi(d.substr(5,2).c_str());
-                                int day = atoi(d.substr(8,2).c_str());
-                                if (m < 1 || m > 12 || day < 1 || day > 31) continue;
-                                int yy = y; static const int t_[] = {0,3,2,5,0,3,5,1,4,6,2,4};
-                                if (m < 3) yy -= 1;
-                                int wd = (yy + yy/4 - yy/100 + yy/400 + t_[m-1] + day) % 7;
-                                int hi = (int)tmax[i+1].as<float>();
-                                int lo = (int)tmin[i+1].as<float>();
-                                int dc = dcodes[i+1].as<int>();
-                                char buf[32];
-                                snprintf(buf, sizeof(buf), "%s|%d|%d|%d", wdays[wd], hi, lo, dc);
-                                std::string s = buf;
-                                if (i == 0) id(fcst_1).publish_state(s);
-                                if (i == 1) id(fcst_2).publish_state(s);
-                                if (i == 2) id(fcst_3).publish_state(s);
-                              }
-                            }
-                          }
-                          return true;
-                        });
-                    - component.update: epaper
-
 interval:
-  - interval: 30min
+  - interval: ${weather_fetch_interval}
     startup_delay: 15s
     then:
       - script.execute: wx_fetch
 
 binary_sensor:
+  # The button on the back of the sign: a manual refresh, for when the
+  # forecast on the panel is older than you would like.
   - platform: gpio
     pin:
       number: GPIO3
@@ -379,110 +93,5 @@ binary_sensor:
       then:
         - script.execute: wx_fetch
 
-display:
-  - platform: epaper_spi
-    id: epaper
-    model: Seeed-reTerminal-E1001
-    update_interval: 15min
-    full_update_every: 8
-    rotation: 0°
-    lambda: |-
-      it.fill(Color::WHITE);
-      const int W = it.get_width();
-      // Faux-grayscale: panel driver is binary-only (no 4-level gray in ESPHome),
-      // so hierarchy comes from dotted rules + inverted badge instead of gray fills.
-      // Header: "October 13th" left, time top-right
-      if (id(sntp_time).now().is_valid()) {
-        auto t = id(sntp_time).now();
-        const char *months[] = {"", "January", "February", "March", "April", "May", "June",
-          "July", "August", "September", "October", "November", "December"};
-        int d = t.day_of_month;
-        const char *suf = "th";
-        if (d % 10 == 1 && d != 11) suf = "st";
-        else if (d % 10 == 2 && d != 12) suf = "nd";
-        else if (d % 10 == 3 && d != 13) suf = "rd";
-        it.printf(20, 10, id(font_med), Color::BLACK, TextAlign::TOP_LEFT,
-          "%s %d%s", months[t.month], d, suf);
-        // Time plain top-right
-        it.printf(W - 20, 10, id(font_small), Color::BLACK, TextAlign::TOP_RIGHT,
-          "%02d:%02d", t.hour, t.minute);
-      } else {
-        it.print(20, 10, id(font_med), Color::BLACK, TextAlign::TOP_LEFT, "--");
-      }
-      // Indoor moved to bottom-right (see below).
-      // Dotted rule (stipple = faux gray): dots every 6px instead of solid line
-      for (int x = 20; x < W - 20; x += 6) it.filled_circle(x, 62, 1, Color::BLACK);
-      if (id(wx_condition).has_state()) {
-        std::string c = id(wx_condition).state;
-        auto *icon = &id(hero_cloudy);
-        const char *friendly = "Cloudy";
-        if (c=="sunny") { icon = &id(hero_sunny); friendly = "Sunny"; }
-        else if (c=="clear-night") { icon = &id(hero_clear_night); friendly = "Clear Night"; }
-        else if (c=="partlycloudy") { icon = &id(hero_partly); friendly = "Partly Cloudy"; }
-        else if (c=="cloudy") { icon = &id(hero_cloudy); friendly = "Cloudy"; }
-        else if (c=="fog") { icon = &id(hero_fog); friendly = "Fog"; }
-        else if (c=="rainy") { icon = &id(hero_rain); friendly = "Rain"; }
-        else if (c=="storm") { icon = &id(hero_storm); friendly = "Storm"; }
-        else if (c=="snowy") { icon = &id(hero_snow); friendly = "Snow"; }
-        it.image(30, 90, *icon, Color::BLACK, COLOR_OFF);
-        it.print(190, 100, id(font_small), Color::BLACK, TextAlign::TOP_LEFT, friendly);
-      }
-      if (id(wx_temp).has_state()) {
-        it.printf(190, 140, id(font_big), Color::BLACK, TextAlign::TOP_LEFT, "%.0fF", id(wx_temp).state);
-        it.printf(190, 230, id(font_small), Color::BLACK, TextAlign::TOP_LEFT,
-          "H %.0f%%  Wind %.0f mph", id(wx_humidity).state, id(wx_wind).state);
-      } else {
-        it.print(180, 140, id(font_big), Color::BLACK, TextAlign::TOP_LEFT, "--F");
-      }
-      if (id(sun_rise).has_state() && id(sun_set).has_state()) {
-        it.printf(W - 20, 100, id(font_mono), Color::BLACK, TextAlign::TOP_RIGHT,
-          "^%s", id(sun_rise).state.c_str());
-        it.printf(W - 20, 140, id(font_mono), Color::BLACK, TextAlign::TOP_RIGHT,
-          "v%s", id(sun_set).state.c_str());
-      } // e.g. ^6:58a / v7:12p, right of hero
-      for (int x = 20; x < W - 20; x += 6) it.filled_circle(x, 280, 1, Color::BLACK);
-      // Forecast row: fixed slots, icon 64px, temps BELOW icon with gap. No overlap by construction.
-      // Row budget: badge 288-318, icon 324-388, temps 394, footer 440, indoor 444-478.
-      int colx[3] = {60, 310, 560};
-      std::string raws[3] = {id(fcst_1).state, id(fcst_2).state, id(fcst_3).state};
-      for (int i = 0; i < 3; i++) {
-        std::string s = raws[i];
-        if (s.empty()) {
-          it.print(colx[i], 288, id(font_small), Color::BLACK, TextAlign::TOP_LEFT, "--");
-          continue;
-        }
-        // split on '|'
-        std::string parts[4]; int pi = 0;
-        size_t pos = 0, nxt;
-        while (pi < 3 && (nxt = s.find('|', pos)) != std::string::npos) {
-          parts[pi++] = s.substr(pos, nxt - pos); pos = nxt + 1;
-        }
-        parts[pi] = s.substr(pos);
-        int hi = atoi(parts[1].c_str()); int lo = atoi(parts[2].c_str());
-        int dc = atoi(parts[3].c_str());
-        // Day plain, no badge
-        it.print(colx[i], 288, id(font_small), Color::BLACK, TextAlign::TOP_LEFT, parts[0].c_str());
-        auto *fic = &id(icon_cloudy);
-        if (dc == 0) fic = &id(icon_sunny);
-        else if (dc == 1) fic = &id(icon_partly);
-        else if (dc <= 3) fic = &id(icon_cloudy);
-        else if (dc <= 48) fic = &id(icon_fog);
-        else if (dc <= 67) fic = &id(icon_rain);
-        else if (dc <= 77) fic = &id(icon_snow);
-        else if (dc <= 82) fic = &id(icon_rain);
-        else if (dc <= 86) fic = &id(icon_snow);
-        else fic = &id(icon_storm);
-        it.image(colx[i], 324, *fic, Color::BLACK, COLOR_OFF);
-        it.printf(colx[i], 394, id(font_small), Color::BLACK, TextAlign::TOP_LEFT,
-          "%d/%dF", hi, lo);
-        if (i < 2) {
-          // dotted vertical divider = lighter than solid rule
-          for (int y = 288; y < 432; y += 6) it.filled_circle(colx[i] + 190, y, 1, Color::BLACK);
-        }
-      }
-      for (int x = 20; x < W - 20; x += 6) it.filled_circle(x, 438, 1, Color::BLACK);
-      // Bottom strip: indoor temp/humidity, own reserved band 442-478, never touched by forecast
-      if (id(room_temp).has_state()) {
-        it.printf(W - 20, 444, id(font_mono), Color::BLACK, TextAlign::TOP_RIGHT,
-          "%.0fF %.0f%%", id(room_temp).state * 9.0 / 5.0 + 32.0, id(room_hum).state);
-      }
+packages:
+  common: !include packages/weather-sign-common.yaml
