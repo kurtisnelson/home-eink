@@ -6,7 +6,7 @@
 #
 # How a cycle works:
 #   1. The ESP32 wakes from deep sleep (timer, or the GPIO3 button).
-#   2. WiFi comes up, the clock syncs, Open-Meteo is polled.
+#   2. WiFi comes up, the clock syncs, NWS is polled (Open-Meteo on failure).
 #   3. The e-paper panel is redrawn with the new numbers.
 #   4. The device goes back to sleep until the next cycle.
 #
@@ -42,13 +42,17 @@ substitutions:
   # mode off, or during an extended awake window). In sleep mode the refresh
   # cadence is set by sleep_interval below.
   weather_fetch_interval: 30min
+  nws_user_agent: "home-eink-weather-sign (https://github.com/kurtisnelson/home-eink)"
+  # Nearest NWS observation station. KSFO is San Francisco Intl.; change it
+  # with the location. NWS is primary and Open-Meteo is the fallback.
+  nws_station: KSFO
   # How long the device stays asleep between refreshes.
   sleep_interval: 1h
-  # How long the device stays awake after a wake-up before it is allowed to
-  # sleep again. It has to cover: WiFi association (~5 s) + NTP sync (<=10 s)
-  # + the HTTP round trip (~3 s) + the 5 s radio/panel separation + the
-  # e-paper refresh (up to ~30 s). Raise it if the panel is sometimes caught
-  # mid-refresh, lower it to save battery.
+  # Minimum awake time after a wake-up: WiFi association (~5 s) + NTP sync
+  # (<=10 s) + the fetch + the 5 s radio/panel separation + the e-paper refresh
+  # (up to ~30 s). The sleep check also refuses to sleep while wx_busy is set
+  # or until 35 s after the panel refresh starts, so a slow NWS -> Open-Meteo
+  # fallback cannot be cut off mid-refresh. This value is only the floor.
   awake_seconds: 75s
   # How long a button press keeps the device awake and connected, so there is
   # time to change the "Sleep Mode" switch in Home Assistant.
@@ -177,6 +181,11 @@ script:
               // 2. Never sleep inside the window a button press opened.
               //    Signed difference so the millis() wrap-around is safe.
               if ((int32_t) (millis() - id(awake_until)) < 0) return false;
+              // 3. Never sleep while the fetch/fallback chain is still running
+              //    or while the panel is still refreshing (component.update
+              //    returns before the refresh finishes).
+              if (id(wx_busy)) return false;
+              if ((int32_t) (millis() - id(wx_ready_at)) < 0) return false;
               return true;
           then:
             - logger.log:
