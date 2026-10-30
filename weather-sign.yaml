@@ -1,8 +1,8 @@
 # reTerminal E1001 weather sign - ALWAYS ON build.
 #
 # This is the "connected" build: the radio stays up, Home Assistant stays
-# connected, and the panel is refreshed from Home Assistant's weather entities
-# on a timer (see home-assistant/weather-sign.yaml for the data side).
+# connected, the panel refreshes itself every 15 minutes and the forecast is
+# refetched on a timer.
 #
 # Battery notes for this build:
 #   * The radio is the whole budget. With `wifi_power_save_mode: none` the
@@ -18,6 +18,8 @@
 substitutions:
   name: weather-sign
   friendly_name: Weather Sign
+  latitude: !secret latitude
+  longitude: !secret longitude
   # (battery) none keeps the radio in active mode all the time - the most
   # reliable setting, and the one this device was reported offline with when
   # it was LIGHT. light drops the radio into modem sleep between beacons and
@@ -26,9 +28,9 @@ substitutions:
   # slow reconnection on a weak signal. Try it with a spare battery first;
   # switching it back is a one-line change.
   wifi_power_save_mode: none
-  # How often the panel is refreshed from Home Assistant. 30min is a good
-  # balance; the panel itself still redraws every 15min (see the display
-  # update_interval in the package) so the clock on the sign stays fresh.
+  # How often the forecast is refetched. 30min is a good balance; the panel
+  # itself still redraws every 15min (see the display update_interval in the
+  # package) so the clock on the sign stays fresh.
   weather_fetch_interval: 30min
 
 esphome:
@@ -73,9 +75,7 @@ time:
 
 interval:
   - interval: ${weather_fetch_interval}
-    # Give WiFi and the native API to Home Assistant time to come up and for
-    # HA to push the current weather entities before the first refresh.
-    startup_delay: 30s
+    startup_delay: 15s
     then:
       - script.execute: wx_fetch
 
