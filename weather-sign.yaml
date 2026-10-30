@@ -32,6 +32,10 @@ substitutions:
   # itself still redraws every 15min (see the display update_interval in the
   # package) so the clock on the sign stays fresh.
   weather_fetch_interval: 30min
+  nws_user_agent: "home-eink-weather-sign (https://github.com/kurtisnelson/home-eink)"
+  # Nearest NWS observation station. KSFO is San Francisco Intl.; change it
+  # with the location. NWS is primary and Open-Meteo is the fallback.
+  nws_station: KSFO
 
 esphome:
   name: ${name}

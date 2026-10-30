@@ -1,9 +1,9 @@
 # Shared hardware + weather pipeline for the Seeed reTerminal E1001 weather sign.
 #
 # Everything both power modes have in common lives here exactly once:
-# the board, the radios, the sensors, the e-paper panel and the Open-Meteo
-# fetch pipeline. The two device files only describe what actually differs
-# between them:
+# the board, the radios, the sensors, the e-paper panel and the NWS fetch
+# pipeline. The two device files only describe what actually differs between
+# them:
 #
 #   weather-sign.yaml        -> always on (WiFi stays up, HA stays connected)
 #   weather-sign-sleep.yaml  -> deep sleep (radio off between refreshes)
@@ -17,6 +17,11 @@
 #   ${latitude}, ${longitude}      - sign location (from secrets)
 #   ${wifi_power_save_mode}        - none | light | high
 #   ${weather_fetch_interval}      - how often the forecast is refetched
+#   ${nws_user_agent}              - NWS-required contact string
+#   ${nws_station}                 - nearby NWS observation station (e.g. KSFO)
+#
+# NWS is the primary source. Open-Meteo is only a fallback for a failed NWS
+# request or a non-US location; both are fetched on-device, never from HA.
 #
 # Secrets the including device file MUST provide (used through !secret below):
 #   wifi_ssid, wifi_password, weather_sign__encryption_key,
@@ -151,7 +156,7 @@ image:
       - file: mdi:weather-snowy
         id: hero_snow
 
-# All weather state lives on-device, filled by Open-Meteo fetch below.
+# All weather state lives on-device, filled by the NWS fetch below.
 # Only Room Temp/Humidity + Battery are named => only those go to HA.
 text_sensor:
   - platform: template
@@ -231,6 +236,47 @@ http_request:
   timeout: 15s
 json:
 
+globals:
+  # NWS resolves a grid once per fetch, then uses it for the forecast request.
+  - id: nws_grid_id
+    type: std::string
+    restore_value: false
+  - id: nws_grid_x
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: nws_grid_y
+    type: int
+    restore_value: false
+    initial_value: '0'
+  - id: nws_points_ok
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: nws_forecast_ok
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: nws_have_wind
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: nws_wind_fallback
+    type: float
+    restore_value: false
+    initial_value: '0.0'
+  # Set while a fetch chain is running and until the panel has had time to
+  # finish its refresh. The sleep build uses these to avoid going to sleep in
+  # the middle of a slow NWS -> Open-Meteo fallback.
+  - id: wx_busy
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: wx_ready_at
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
 script:
   - id: wx_fetch
     then:
@@ -249,7 +295,293 @@ script:
           else:
             - script.execute: wx_do_fetch
   # Split out so wx_fetch can skip the fetch entirely when the battery is low.
+  # NWS is the primary source: points -> grid forecast -> nearest observation.
+  # Any failure calls wx_fetch_open_meteo, so a transient NWS problem or a
+  # non-US location still leaves a complete image instead of a blank panel.
   - id: wx_do_fetch
+    then:
+      - lambda: |-
+          id(nws_points_ok) = false;
+          id(nws_forecast_ok) = false;
+          id(nws_have_wind) = false;
+          id(wx_busy) = true;
+      - http_request.get:
+          url: https://api.weather.gov/points/${latitude},${longitude}
+          request_headers:
+            User-Agent: "${nws_user_agent}"
+            Accept: application/geo+json
+          capture_response: true
+          max_response_buffer_size: 8192
+          on_response:
+            then:
+              - if:
+                  condition:
+                    lambda: return response->status_code == 200;
+                  then:
+                    - lambda: |-
+                        json::parse_json(body, [](JsonObject root) -> bool {
+                          auto p = root["properties"];
+                          if (p.isNull()) return false;
+                          const char *grid = p["gridId"].as<const char *>();
+                          if (grid == nullptr || strlen(grid) == 0) return false;
+                          id(nws_grid_id) = grid;
+                          id(nws_grid_x) = p["gridX"].as<int>();
+                          id(nws_grid_y) = p["gridY"].as<int>();
+
+                          auto astro = p["astronomicalData"];
+                          auto fmt_time = [](const char *iso) -> std::string {
+                            if (iso == nullptr || *iso == '\0') return "";
+                            std::string s = iso;
+                            auto t = s.find('T');
+                            if (t == std::string::npos || t + 6 > s.size()) return "";
+                            std::string hm = s.substr(t + 1, 5);
+                            int hh = atoi(hm.substr(0, 2).c_str());
+                            std::string mm = hm.substr(3, 2);
+                            const char *ap = (hh >= 12) ? "p" : "a";
+                            int h12 = hh % 12; if (h12 == 0) h12 = 12;
+                            char b[16]; snprintf(b, sizeof(b), "%d:%s%s", h12, mm.c_str(), ap);
+                            return std::string(b);
+                          };
+                          std::string rise = fmt_time(astro["sunrise"].as<const char *>());
+                          std::string set = fmt_time(astro["sunset"].as<const char *>());
+                          if (!rise.empty()) id(sun_rise).publish_state(rise);
+                          if (!set.empty()) id(sun_set).publish_state(set);
+                          id(nws_points_ok) = true;
+                          return true;
+                        });
+                    - if:
+                        condition:
+                          lambda: return id(nws_points_ok);
+                        then:
+                          - script.execute: nws_fetch_forecast
+                        else:
+                          - script.execute: wx_fetch_open_meteo
+                  else:
+                    - script.execute: wx_fetch_open_meteo
+          on_error:
+            then:
+              - script.execute: wx_fetch_open_meteo
+
+  - id: nws_fetch_forecast
+    then:
+      - http_request.get:
+          url: !lambda |-
+            char url[160];
+            snprintf(url, sizeof(url), "https://api.weather.gov/gridpoints/%s/%d,%d/forecast",
+                     id(nws_grid_id).c_str(), id(nws_grid_x), id(nws_grid_y));
+            return std::string(url);
+          request_headers:
+            User-Agent: "${nws_user_agent}"
+            Accept: application/geo+json
+          capture_response: true
+          max_response_buffer_size: 32768
+          on_response:
+            then:
+              - if:
+                  condition:
+                    lambda: return response->status_code == 200;
+                  then:
+                    - lambda: |-
+                        json::parse_json(body, [](JsonObject root) -> bool {
+                          auto periods = root["properties"]["periods"];
+                          if (periods.isNull() || periods.size() == 0) return false;
+
+                          auto now = id(sntp_time).now();
+                          char today_s[16] = {0};
+                          if (now.is_valid()) {
+                            snprintf(today_s, sizeof(today_s), "%04d-%02d-%02d",
+                                     now.year, now.month, now.day_of_month);
+                          }
+
+                          auto condition_code = [](const std::string &raw) -> int {
+                            std::string s = raw;
+                            for (auto &c : s) c = (char)tolower((unsigned char)c);
+                            if (s.find("thunder") != std::string::npos || s.find("storm") != std::string::npos) return 95;
+                            if (s.find("snow") != std::string::npos || s.find("sleet") != std::string::npos || s.find("ice") != std::string::npos) return 71;
+                            if (s.find("rain") != std::string::npos || s.find("shower") != std::string::npos || s.find("drizzle") != std::string::npos) return 61;
+                            if (s.find("fog") != std::string::npos || s.find("haze") != std::string::npos) return 45;
+                            if (s.find("partly") != std::string::npos) return 2;
+                            if (s.find("cloud") != std::string::npos || s.find("overcast") != std::string::npos) return 3;
+                            if (s.find("sunny") != std::string::npos || s.find("clear") != std::string::npos) return 0;
+                            return 3;
+                          };
+                          auto parse_wind = [](const char *raw) -> float {
+                            if (raw == nullptr) return NAN;
+                            const char *p = raw;
+                            int a = -1, b = -1;
+                            while (*p != '\0') {
+                              if (*p >= '0' && *p <= '9') {
+                                char *end = nullptr;
+                                int v = (int)strtol(p, &end, 10);
+                                if (a < 0) a = v; else if (b < 0) b = v;
+                                p = end;
+                              } else {
+                                p++;
+                              }
+                            }
+                            if (a < 0) return NAN;
+                            if (b < 0) b = a;
+                            return (a + b) / 2.0f;
+                          };
+                          auto temp_f = [](JsonObject p) -> float {
+                            float t = p["temperature"].as<float>();
+                            const char *unit = p["temperatureUnit"].as<const char *>();
+                            if (unit != nullptr && unit[0] == 'C') t = t * 9.0f / 5.0f + 32.0f;
+                            return t;
+                          };
+
+                          bool first_wind = true;
+                          int out_i = 0;
+                          for (size_t i = 0; i < periods.size(); i++) {
+                            JsonObject p = periods[i].as<JsonObject>();
+                            if (p.isNull()) continue;
+
+                            if (first_wind) {
+                              float w = parse_wind(p["windSpeed"].as<const char *>());
+                              if (!isnan(w)) {
+                                id(nws_wind_fallback) = w;
+                                id(nws_have_wind) = true;
+                              }
+                              first_wind = false;
+                            }
+
+                            const char *start = p["startTime"].as<const char *>();
+                            std::string date = (start != nullptr && strlen(start) >= 10)
+                                                  ? std::string(start, 10) : "";
+                            const char *name = p["name"].as<const char *>();
+                            std::string name_s = (name != nullptr) ? name : "";
+                            if (!p["isDaytime"].as<bool>()) continue;
+
+                            if (today_s[0] != '\0' && !date.empty()) {
+                              if (date <= today_s) continue;
+                            } else if (name_s.rfind("This ", 0) == 0 ||
+                                       name_s == "Today" || name_s == "Tonight" ||
+                                       name_s == "Overnight") {
+                              continue;
+                            }
+
+                            if (p["temperature"].isNull()) continue;
+                            float hi = temp_f(p);
+                            float lo = hi;
+                            for (size_t j = i + 1; j < periods.size(); j++) {
+                              JsonObject q = periods[j].as<JsonObject>();
+                              if (q.isNull() || q["isDaytime"].as<bool>()) continue;
+                              lo = temp_f(q);
+                              break;
+                            }
+
+                            std::string day = name_s.substr(0, 3);
+                            if (day.empty()) day = "---";
+                            const char *short_fc = p["shortForecast"].as<const char *>();
+                            int dc = condition_code(name_s + " " + (short_fc ? short_fc : ""));
+                            char buf[40];
+                            snprintf(buf, sizeof(buf), "%s|%d|%d|%d",
+                                     day.c_str(), (int)hi, (int)lo, dc);
+                            std::string s = buf;
+                            if (out_i == 0) id(fcst_1).publish_state(s);
+                            else if (out_i == 1) id(fcst_2).publish_state(s);
+                            else if (out_i == 2) id(fcst_3).publish_state(s);
+                            out_i++;
+                            if (out_i >= 3) break;
+                          }
+
+                          id(nws_forecast_ok) = (out_i >= 3);
+                          return out_i >= 3;
+                        });
+                    - if:
+                        condition:
+                          lambda: return id(nws_forecast_ok);
+                        then:
+                          - script.execute: nws_fetch_obs
+                        else:
+                          - script.execute: wx_fetch_open_meteo
+                  else:
+                    - script.execute: wx_fetch_open_meteo
+          on_error:
+            then:
+              - script.execute: wx_fetch_open_meteo
+
+  - id: nws_fetch_obs
+    then:
+      - http_request.get:
+          url: https://api.weather.gov/stations/${nws_station}/observations/latest
+          request_headers:
+            User-Agent: "${nws_user_agent}"
+            Accept: application/geo+json
+          capture_response: true
+          max_response_buffer_size: 8192
+          on_response:
+            then:
+              - if:
+                  condition:
+                    lambda: return response->status_code == 200;
+                  then:
+                    - lambda: |-
+                        json::parse_json(body, [](JsonObject root) -> bool {
+                          auto p = root["properties"];
+                          if (p.isNull()) return false;
+                          auto t = p["temperature"]["value"];
+                          auto h = p["relativeHumidity"]["value"];
+                          if (t.isNull() || h.isNull()) return false;
+
+                          id(wx_temp).publish_state(t.as<float>() * 9.0f / 5.0f + 32.0f);
+                          id(wx_humidity).publish_state(h.as<float>());
+
+                          auto w = p["windSpeed"]["value"];
+                          float wind = NAN;
+                          if (!w.isNull()) wind = w.as<float>() * 0.621371f;
+                          else if (id(nws_have_wind)) wind = id(nws_wind_fallback);
+                          id(wx_wind).publish_state(wind);
+
+                          std::string text = p["textDescription"].as<const char *>()
+                                               ? p["textDescription"].as<const char *>() : "";
+                          std::string icon = p["icon"].as<const char *>()
+                                               ? p["icon"].as<const char *>() : "";
+                          bool day = icon.find("/day/") != std::string::npos;
+                          for (auto &c : text) c = (char)tolower((unsigned char)c);
+                          std::string label = "cloudy";
+                          if (text.find("thunder") != std::string::npos || text.find("storm") != std::string::npos) label = "storm";
+                          else if (text.find("snow") != std::string::npos || text.find("sleet") != std::string::npos || text.find("ice") != std::string::npos) label = "snowy";
+                          else if (text.find("rain") != std::string::npos || text.find("shower") != std::string::npos || text.find("drizzle") != std::string::npos) label = "rainy";
+                          else if (text.find("fog") != std::string::npos || text.find("haze") != std::string::npos) label = "fog";
+                          else if (text.find("partly") != std::string::npos) label = "partlycloudy";
+                          else if (text.find("cloud") != std::string::npos || text.find("overcast") != std::string::npos) label = "cloudy";
+                          else if (text.find("sunny") != std::string::npos || text.find("clear") != std::string::npos) label = day ? "sunny" : "clear-night";
+                          id(wx_condition).publish_state(label);
+                          int code = 3;
+                          if (label == "storm") code = 95;
+                          else if (label == "snowy") code = 71;
+                          else if (label == "rainy") code = 61;
+                          else if (label == "fog") code = 45;
+                          else if (label == "partlycloudy") code = 2;
+                          else if (label == "sunny" || label == "clear-night") code = 0;
+                          id(wx_code).publish_state((float)code);
+                          return true;
+                        });
+                    - if:
+                        condition:
+                          lambda: return id(wx_temp).has_state() && !isnan(id(wx_temp).state) &&
+                                          id(wx_humidity).has_state() && !isnan(id(wx_humidity).state) &&
+                                          id(wx_condition).has_state() && !id(wx_condition).state.empty();
+                        then:
+                          - delay: 5s
+                          - component.update: epaper
+                          # component.update returns before the panel finishes;
+                          # keep the sleep build awake long enough for it.
+                          - lambda: |-
+                              id(wx_ready_at) = millis() + 35000UL;
+                              id(wx_busy) = false;
+                        else:
+                          - script.execute: wx_fetch_open_meteo
+                  else:
+                    - script.execute: wx_fetch_open_meteo
+          on_error:
+            then:
+              - script.execute: wx_fetch_open_meteo
+
+  # Last-resort source: one compact request, complete current + daily fields.
+  # See docs/weather-sources.md for the source comparison and measurements.
+  - id: wx_fetch_open_meteo
     then:
       - http_request.get:
           url: https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,is_day&daily=temperature_2m_max,temperature_2m_min,weather_code,sunrise,sunset&timezone=auto&forecast_days=4&temperature_unit=fahrenheit&wind_speed_unit=mph
@@ -301,7 +633,7 @@ script:
                             };
                             auto sr = daily["sunrise"];
                             auto ss = daily["sunset"];
-                            if (!sr.isNull() && !ss.isNull()) {
+                            if (!sr.isNull() && !ss.isNull() && sr.size() > 0 && ss.size() > 0) {
                               auto sr_s = fmt_time(sr[0].as<const char *>());
                               auto ss_s = fmt_time(ss[0].as<const char *>());
                               if (!sr_s.empty()) id(sun_rise).publish_state(sr_s);
@@ -313,7 +645,9 @@ script:
                             auto dcodes = daily["weather_code"];
                             // Guard every array: a partial/odd API payload used to reach
                             // std::string(nullptr) below and panic into a reboot loop.
-                            if (!dates.isNull() && !tmax.isNull() && !tmin.isNull() && !dcodes.isNull()) {
+                            if (!dates.isNull() && !tmax.isNull() && !tmin.isNull() && !dcodes.isNull() &&
+                                dates.size() >= 4 && tmax.size() >= 4 &&
+                                tmin.size() >= 4 && dcodes.size() >= 4) {
                               const char *wdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
                               for (int i = 0; i < 3; i++) {
                                 const char *dstr = dates[i+1].as<const char *>();
@@ -350,6 +684,20 @@ script:
                     # radio settle first. Costs 5 s of awake time.
                     - delay: 5s
                     - component.update: epaper
+                    - lambda: |-
+                        id(wx_ready_at) = millis() + 35000UL;
+                        id(wx_busy) = false;
+                  else:
+                    # No source produced data: let the sleep build continue
+                    # instead of waiting on a busy flag forever.
+                    - lambda: |-
+                        id(wx_ready_at) = millis();
+                        id(wx_busy) = false;
+          on_error:
+            then:
+              - lambda: |-
+                  id(wx_ready_at) = millis();
+                  id(wx_busy) = false;
 
 display:
   - platform: epaper_spi
@@ -399,10 +747,16 @@ display:
         it.image(30, 90, *icon, Color::BLACK, COLOR_OFF);
         it.print(190, 100, id(font_small), Color::BLACK, TextAlign::TOP_LEFT, friendly);
       }
-      if (id(wx_temp).has_state()) {
+      if (id(wx_temp).has_state() && !isnan(id(wx_temp).state)) {
+        char hum[8] = "--";
+        char wind[16] = "--";
+        if (id(wx_humidity).has_state() && !isnan(id(wx_humidity).state))
+          snprintf(hum, sizeof(hum), "%.0f%%", id(wx_humidity).state);
+        if (id(wx_wind).has_state() && !isnan(id(wx_wind).state))
+          snprintf(wind, sizeof(wind), "%.0f mph", id(wx_wind).state);
         it.printf(190, 140, id(font_big), Color::BLACK, TextAlign::TOP_LEFT, "%.0fF", id(wx_temp).state);
         it.printf(190, 230, id(font_small), Color::BLACK, TextAlign::TOP_LEFT,
-          "H %.0f%%  Wind %.0f mph", id(wx_humidity).state, id(wx_wind).state);
+          "H %s  Wind %s", hum, wind);
       } else {
         it.print(180, 140, id(font_big), Color::BLACK, TextAlign::TOP_LEFT, "--F");
       }
