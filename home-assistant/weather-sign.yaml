@@ -1,0 +1,248 @@
+# Home Assistant package for the reTerminal E1001 weather sign.
+#
+# The sign no longer talks to a weather API itself. Home Assistant owns the
+# data and ESPHome imports these entities over the native API:
+#
+#   sensor.weather_sign_temperature   -> current temp (F)
+#   sensor.weather_sign_humidity      -> current humidity (%)
+#   sensor.weather_sign_wind_speed    -> current wind (mph)
+#   sensor.weather_sign_condition     -> sunny | clear-night | partlycloudy | ...
+#   sensor.weather_sign_sunrise       -> e.g. 6:58a
+#   sensor.weather_sign_sunset        -> e.g. 7:12p
+#   sensor.weather_sign_forecast      -> attribute `days` = "Tue|72|54|1;..."
+#
+# Data source: the official National Weather Service integration
+# (Settings -> Devices & services -> Add integration -> National Weather
+# Service). It is free, needs no API key, and uses the local NWS forecast
+# office grid instead of a global model blend. It is US-only.
+#
+# Setup:
+#   1. Add the NWS integration and point it at the sign's location. Its
+#      "API key" field is really a User-Agent/contact string (NWS requires
+#      one), so put something like "home-eink-weather-sign you@example.com".
+#      Optionally set a station code to choose the current-conditions METAR
+#      station (3-letter codes need a leading K, e.g. KADW).
+#   2. Replace every `weather.forecast_home` in this file with the weather
+#      entity the integration created (Developer tools -> States -> filter
+#      `weather.`).
+#   3. Copy this file to `config/packages/weather-sign.yaml` and enable
+#      packages in configuration.yaml if you have not already:
+#          homeassistant:
+#            packages: !include_dir_named packages
+#   4. Check the entity ids under Developer tools -> States. If a name was
+#      already taken, Home Assistant may have appended `_2`; rename the new
+#      entity or update the ESPHome package to match.
+#
+# The points lookup below uses zone.home for the sign's coordinates. If the
+# sign is not at your home zone, replace zone.home with the latitude/longitude
+# you used to have in the ESPHome secrets.yaml, and use those coordinates when
+# setting up the NWS integration too.
+
+rest:
+  - resource_template: "https://api.weather.gov/points/{{ state_attr('zone.home', 'latitude') }},{{ state_attr('zone.home', 'longitude') }}"
+    headers:
+      # NWS rejects requests without a identifying User-Agent. Including a
+      # contact makes it possible for them to reach you if needed.
+      User-Agent: "home-eink-weather-sign (https://github.com/kurtisnelson/home-eink)"
+      Accept: "application/geo+json"
+    scan_interval: 3600
+    sensor:
+      - name: "Weather Sign NWS Location"
+        unique_id: weather_sign_nws_location
+        icon: mdi:map-marker-radius
+        value_template: "{{ value_json.properties.relativeLocation.properties.city }}"
+        json_attributes_path: "$.properties"
+        json_attributes:
+          - forecast
+          - forecastHourly
+          - forecastGridData
+          - timeZone
+          - astronomicalData
+          - relativeLocation
+
+template:
+  - sensor:
+      - name: "Weather Sign Temperature"
+        unique_id: weather_sign_temperature
+        icon: mdi:thermometer
+        device_class: temperature
+        state_class: measurement
+        unit_of_measurement: "°F"
+        availability: "{{ has_value('weather.forecast_home') }}"
+        state: >-
+          {%- set w = 'weather.forecast_home' -%}
+          {%- set v = state_attr(w, 'temperature') -%}
+          {%- if v is none -%}
+          unavailable
+          {%- elif state_attr(w, 'temperature_unit') == '°C' -%}
+          {{ (v * 9 / 5 + 32) | round(1) }}
+          {%- else -%}
+          {{ v | round(1) }}
+          {%- endif -%}
+
+      - name: "Weather Sign Humidity"
+        unique_id: weather_sign_humidity
+        icon: mdi:water-percent
+        device_class: humidity
+        state_class: measurement
+        unit_of_measurement: "%"
+        availability: "{{ has_value('weather.forecast_home') }}"
+        state: >-
+          {%- set v = state_attr('weather.forecast_home', 'humidity') -%}
+          {%- if v is none -%}
+          unavailable
+          {%- else -%}
+          {{ v | round(0) }}
+          {%- endif -%}
+
+      - name: "Weather Sign Wind Speed"
+        unique_id: weather_sign_wind_speed
+        icon: mdi:weather-windy
+        device_class: wind_speed
+        state_class: measurement
+        unit_of_measurement: "mph"
+        availability: "{{ has_value('weather.forecast_home') }}"
+        state: >-
+          {%- set w = 'weather.forecast_home' -%}
+          {%- set v = state_attr(w, 'wind_speed') -%}
+          {%- set u = state_attr(w, 'wind_speed_unit') -%}
+          {%- if v is none -%}
+          unavailable
+          {%- elif u in ['km/h', 'kph'] -%}
+          {{ (v * 0.621371) | round(1) }}
+          {%- elif u == 'm/s' -%}
+          {{ (v * 2.236936) | round(1) }}
+          {%- elif u in ['kn', 'kt'] -%}
+          {{ (v * 1.150779) | round(1) }}
+          {%- elif u == 'ft/s' -%}
+          {{ (v * 0.681818) | round(1) }}
+          {%- else -%}
+          {{ v | round(1) }}
+          {%- endif -%}
+
+      - name: "Weather Sign Condition"
+        unique_id: weather_sign_condition
+        icon: mdi:weather-partly-cloudy
+        availability: "{{ has_value('weather.forecast_home') }}"
+        state: >-
+          {%- set m = {
+            'clear-night': 'clear-night',
+            'cloudy': 'cloudy',
+            'exceptional': 'storm',
+            'fog': 'fog',
+            'hail': 'storm',
+            'lightning': 'storm',
+            'lightning-rainy': 'storm',
+            'partlycloudy': 'partlycloudy',
+            'pouring': 'rainy',
+            'rainy': 'rainy',
+            'snowy': 'snowy',
+            'snowy-rainy': 'snowy',
+            'sunny': 'sunny',
+            'windy': 'cloudy',
+            'windy-variant': 'cloudy'
+          } -%}
+          {{ m.get(states('weather.forecast_home'), 'cloudy') }}
+
+      - name: "Weather Sign Sunrise"
+        unique_id: weather_sign_sunrise
+        icon: mdi:weather-sunset-up
+        availability: "{{ state_attr('sensor.weather_sign_nws_location', 'astronomicalData') is not none }}"
+        state: >-
+          {%- set a = state_attr('sensor.weather_sign_nws_location', 'astronomicalData') -%}
+          {%- if a and a.sunrise -%}
+          {{ as_timestamp(a.sunrise) | timestamp_custom('%-I:%M%p') | replace('AM', 'a') | replace('PM', 'p') }}
+          {%- else -%}
+          unavailable
+          {%- endif -%}
+
+      - name: "Weather Sign Sunset"
+        unique_id: weather_sign_sunset
+        icon: mdi:weather-sunset-down
+        availability: "{{ state_attr('sensor.weather_sign_nws_location', 'astronomicalData') is not none }}"
+        state: >-
+          {%- set a = state_attr('sensor.weather_sign_nws_location', 'astronomicalData') -%}
+          {%- if a and a.sunset -%}
+          {{ as_timestamp(a.sunset) | timestamp_custom('%-I:%M%p') | replace('AM', 'a') | replace('PM', 'p') }}
+          {%- else -%}
+          unavailable
+          {%- endif -%}
+
+  # The NWS integration only exposes an hourly and a twice-daily forecast
+  # (no daily), so pull the twice-daily one and pair each daytime high with
+  # the following night's low. Today is skipped because the sign already
+  # shows current conditions in that slot; the three rows are tomorrow, the
+  # day after, and the day after that.
+  - triggers:
+      - trigger: homeassistant
+        event: start
+      - trigger: event
+        event_type: event_template_reloaded
+      - trigger: time_pattern
+        minutes: "/15"
+    sensor:
+      - name: "Weather Sign Forecast"
+        unique_id: weather_sign_forecast
+        icon: mdi:weather-cloudy-clock
+        state: >-
+          {%- if wx is defined and 'weather.forecast_home' in wx -%}
+          {{ wx['weather.forecast_home'].forecast | length }}
+          {%- else -%}
+          {{ this.state }}
+          {%- endif -%}
+        attributes:
+          # "Day|high|low|WMOcode" for each of the next three days, separated
+          # by semicolons. The WMO codes match the icon mapping on the sign:
+          # 0 sunny, 1 partly cloudy, 3 cloudy, 45 fog, 61 rain, 65 heavy
+          # rain, 71 snow, 95 storm, 96 hail.
+          days: >-
+            {%- set w = 'weather.forecast_home' -%}
+            {%- set ns = namespace(days=[]) -%}
+            {%- if wx is defined and w in wx and wx[w].forecast -%}
+              {%- set fc = wx[w].forecast -%}
+              {%- set today = now().strftime('%Y-%m-%d') -%}
+              {%- set tu = state_attr(w, 'temperature_unit') -%}
+              {%- for p in fc -%}
+                {%- if p.is_daytime and p.datetime and p.datetime[:10] != today and (ns.days | length) < 3 -%}
+                  {%- set hi = p.temperature -%}
+                  {%- set lo = fc[loop.index0 + 1].temperature if (fc | length) > (loop.index0 + 1) and not fc[loop.index0 + 1].is_daytime else none -%}
+                  {%- if hi is not none and lo is not none -%}
+                    {%- if tu == '°C' -%}
+                      {%- set hi = (hi * 9 / 5 + 32) | round(0) | int -%}
+                      {%- set lo = (lo * 9 / 5 + 32) | round(0) | int -%}
+                    {%- else -%}
+                      {%- set hi = hi | round(0) | int -%}
+                      {%- set lo = lo | round(0) | int -%}
+                    {%- endif -%}
+                    {%- set code = {
+                      'sunny': 0,
+                      'clear-night': 0,
+                      'partlycloudy': 1,
+                      'cloudy': 3,
+                      'windy': 3,
+                      'windy-variant': 3,
+                      'fog': 45,
+                      'rainy': 61,
+                      'pouring': 65,
+                      'snowy': 71,
+                      'snowy-rainy': 71,
+                      'lightning': 95,
+                      'lightning-rainy': 95,
+                      'hail': 96,
+                      'exceptional': 95
+                    }.get(p.condition, 3) -%}
+                    {%- set day = as_timestamp(p.datetime) | timestamp_custom('%a') -%}
+                    {%- set ns.days = ns.days + [day ~ '|' ~ hi ~ '|' ~ lo ~ '|' ~ code] -%}
+                  {%- endif -%}
+                {%- endif -%}
+              {%- endfor -%}
+            {%- endif -%}
+            {{ (ns.days | join(';') if ns.days else this.attributes.days | default('')) | trim }}
+        actions:
+          - action: weather.get_forecasts
+            target:
+              entity_id: weather.forecast_home
+            data:
+              type: twice_daily
+            response_variable: wx
+            continue_on_error: true

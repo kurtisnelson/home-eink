@@ -1,12 +1,19 @@
 # Shared hardware + weather pipeline for the Seeed reTerminal E1001 weather sign.
 #
 # Everything both power modes have in common lives here exactly once:
-# the board, the radios, the sensors, the e-paper panel and the Open-Meteo
-# fetch pipeline. The two device files only describe what actually differs
-# between them:
+# the board, the radios, the sensors, the e-paper panel and the weather import
+# from Home Assistant. The two device files only describe what actually
+# differs between them:
 #
 #   weather-sign.yaml        -> always on (WiFi stays up, HA stays connected)
 #   weather-sign-sleep.yaml  -> deep sleep (radio off between refreshes)
+#
+# Weather data no longer comes from a weather API called by the ESP32. Home
+# Assistant owns it (the official NWS integration in
+# home-assistant/weather-sign.yaml) and this device imports the resulting
+# entities over the native API. That keeps the API keys/User-Agents, retries,
+# unit handling and forecast logic in one place on a machine that is always
+# online, and lets the device stay a thin display.
 #
 # Because ESPHome merges package + device config with the *device* winning for
 # scalars, each device file may override anything here. Lists are concatenated,
@@ -14,13 +21,15 @@
 # deliberately NOT defined in this package when a device also defines it.
 #
 # Substitutions the including device file MUST define:
-#   ${latitude}, ${longitude}      - sign location (from secrets)
 #   ${wifi_power_save_mode}        - none | light | high
-#   ${weather_fetch_interval}      - how often the forecast is refetched
+#   ${weather_fetch_interval}      - how often the panel is refreshed from HA
 #
 # Secrets the including device file MUST provide (used through !secret below):
 #   wifi_ssid, wifi_password, weather_sign__encryption_key,
 #   weather_sign__ota_password
+#
+# The Home Assistant entity ids below are the defaults created by the HA
+# package. If yours differ (or HA appended `_2`), change them here.
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -151,21 +160,25 @@ image:
       - file: mdi:weather-snowy
         id: hero_snow
 
-# All weather state lives on-device, filled by Open-Meteo fetch below.
-# Only Room Temp/Humidity + Battery are named => only those go to HA.
+# Weather state is imported from Home Assistant (see
+# home-assistant/weather-sign.yaml). These are read-only mirrors; `internal`
+# defaults to true, so they do not get published back to HA.
 text_sensor:
-  - platform: template
+  - platform: homeassistant
     id: wx_condition
-  - platform: template
-    id: fcst_1
-  - platform: template
-    id: fcst_2
-  - platform: template
-    id: fcst_3
-  - platform: template
+    entity_id: sensor.weather_sign_condition
+  # All three forecast days arrive as one "Day|hi|lo|code;..." attribute. It
+  # is one entity to watch instead of three, and the display splits it below.
+  - platform: homeassistant
+    id: fcst_all
+    entity_id: sensor.weather_sign_forecast
+    attribute: days
+  - platform: homeassistant
     id: sun_rise
-  - platform: template
+    entity_id: sensor.weather_sign_sunrise
+  - platform: homeassistant
     id: sun_set
+    entity_id: sensor.weather_sign_sunset
   # Why the device rebooted last time. "brownout" here confirms the low-voltage
   # theory; "power-on event" with a low battery points at the pack dying.
   - platform: debug
@@ -173,17 +186,18 @@ text_sensor:
       name: Last Reset Reason
 
 sensor:
-  - platform: template
+  - platform: homeassistant
     id: wx_temp
+    entity_id: sensor.weather_sign_temperature
     unit_of_measurement: °F
-  - platform: template
+  - platform: homeassistant
     id: wx_humidity
+    entity_id: sensor.weather_sign_humidity
     unit_of_measurement: "%"
-  - platform: template
+  - platform: homeassistant
     id: wx_wind
+    entity_id: sensor.weather_sign_wind_speed
     unit_of_measurement: mph
-  - platform: template
-    id: wx_code
   - platform: sht4x
     address: 0x44
     temperature:
@@ -226,130 +240,47 @@ sensor:
           min_value: 0
           max_value: 100
 
-http_request:
-  verify_ssl: false
-  timeout: 15s
-json:
-
 script:
   - id: wx_fetch
     then:
-      # Survive a sagging battery: below ~3.30 V skip the network round-trip
-      # (the CPU/TLS/radio burst) and hold the last image rather than adding a
-      # current spike that can trip the brownout detector. The panel's own
-      # update_interval still runs, so the display is never frozen.
+      # Survive a sagging battery: below ~3.30 V skip the radio burst and hold
+      # the last image rather than adding a current spike that can trip the
+      # brownout detector. The panel's own update_interval still runs, so the
+      # display is never frozen.
       - if:
           condition:
             lambda: return !isnan(id(batt_v).state) && id(batt_v).state < 3.30f;
           then:
             - logger.log:
                 level: WARN
-                format: "Battery low (%.2f V): skipping weather fetch"
+                format: "Battery low (%.2f V): skipping weather refresh"
                 args: ['id(batt_v).state']
           else:
-            - script.execute: wx_do_fetch
-  # Split out so wx_fetch can skip the fetch entirely when the battery is low.
-  - id: wx_do_fetch
-    then:
-      - http_request.get:
-          url: https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,is_day&daily=temperature_2m_max,temperature_2m_min,weather_code,sunrise,sunset&timezone=auto&forecast_days=4&temperature_unit=fahrenheit&wind_speed_unit=mph
-          capture_response: true
-          max_response_buffer_size: 4096
-          on_response:
-            then:
-              - if:
-                  condition:
-                    lambda: return response->status_code == 200;
-                  then:
-                    - lambda: |-
-                        json::parse_json(body, [](JsonObject root) -> bool {
-                          auto cur = root["current"];
-                          if (!cur.isNull()) {
-                            id(wx_temp).publish_state(cur["temperature_2m"].as<float>());
-                            id(wx_humidity).publish_state(cur["relative_humidity_2m"].as<float>());
-                            id(wx_wind).publish_state(cur["wind_speed_10m"].as<float>());
-                            int code = cur["weather_code"].as<int>();
-                            int is_day = cur["is_day"].as<int>();
-                            id(wx_code).publish_state((float)code);
-                            // WMO weather-code -> short label
-                            std::string label = "cloudy";
-                            if (code == 0) label = (is_day ? "sunny" : "clear-night");
-                            else if (code <= 3) label = (code == 1 ? "partlycloudy" : "cloudy");
-                            else if (code <= 48) label = "fog";
-                            else if (code <= 67) label = "rainy";
-                            else if (code <= 77) label = "snowy";
-                            else if (code <= 82) label = "rainy";
-                            else if (code <= 86) label = "snowy";
-                            else if (code <= 99) label = "storm";
-                            id(wx_condition).publish_state(label);
-                          }
-                          auto daily = root["daily"];
-                          if (!daily.isNull()) {
-                            // daily["sunrise"][0] / ["sunset"][0] are ISO local "YYYY-MM-DDTHH:MM"
-                            auto fmt_time = [](const char *iso) -> std::string {
-                              if (iso == nullptr || *iso == '\0') return "";
-                              std::string s = iso;
-                              auto t = s.find('T');
-                              std::string hm = (t == std::string::npos) ? s : s.substr(t + 1, 5);
-                              if (hm.size() < 5) return "";
-                              int hh = atoi(hm.substr(0, 2).c_str());
-                              std::string mm = hm.substr(3, 2);
-                              const char *ap = (hh >= 12) ? "p" : "a";
-                              int h12 = hh % 12; if (h12 == 0) h12 = 12;
-                              char b[16]; snprintf(b, sizeof(b), "%d:%s%s", h12, mm.c_str(), ap);
-                              return std::string(b);
-                            };
-                            auto sr = daily["sunrise"];
-                            auto ss = daily["sunset"];
-                            if (!sr.isNull() && !ss.isNull()) {
-                              auto sr_s = fmt_time(sr[0].as<const char *>());
-                              auto ss_s = fmt_time(ss[0].as<const char *>());
-                              if (!sr_s.empty()) id(sun_rise).publish_state(sr_s);
-                              if (!ss_s.empty()) id(sun_set).publish_state(ss_s);
-                            }
-                            auto tmax = daily["temperature_2m_max"];
-                            auto tmin = daily["temperature_2m_min"];
-                            auto dates = daily["time"];
-                            auto dcodes = daily["weather_code"];
-                            // Guard every array: a partial/odd API payload used to reach
-                            // std::string(nullptr) below and panic into a reboot loop.
-                            if (!dates.isNull() && !tmax.isNull() && !tmin.isNull() && !dcodes.isNull()) {
-                              const char *wdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-                              for (int i = 0; i < 3; i++) {
-                                const char *dstr = dates[i+1].as<const char *>();
-                                if (dstr == nullptr || strlen(dstr) < 10) continue;
-                                std::string d = dstr;
-                                // d = YYYY-MM-DD -> weekday via Sakamoto
-                                int y = atoi(d.substr(0,4).c_str());
-                                int m = atoi(d.substr(5,2).c_str());
-                                int day = atoi(d.substr(8,2).c_str());
-                                if (m < 1 || m > 12 || day < 1 || day > 31) continue;
-                                int yy = y; static const int t_[] = {0,3,2,5,0,3,5,1,4,6,2,4};
-                                if (m < 3) yy -= 1;
-                                int wd = (yy + yy/4 - yy/100 + yy/400 + t_[m-1] + day) % 7;
-                                int hi = (int)tmax[i+1].as<float>();
-                                int lo = (int)tmin[i+1].as<float>();
-                                int dc = dcodes[i+1].as<int>();
-                                char buf[32];
-                                snprintf(buf, sizeof(buf), "%s|%d|%d|%d", wdays[wd], hi, lo, dc);
-                                std::string s = buf;
-                                if (i == 0) id(fcst_1).publish_state(s);
-                                if (i == 1) id(fcst_2).publish_state(s);
-                                if (i == 2) id(fcst_3).publish_state(s);
-                              }
-                            }
-                          }
-                          return true;
-                        });
-                    # (battery) Separate the radio TX burst of the HTTP response
-                    # from the e-paper refresh. The panel pulls ~20-30 mA for
-                    # ~20 s while it drives the pixels, and the WiFi stack is
-                    # still pushing the HTTP response/ACK out of the radio at
-                    # the same time. Overlapping the two peaks is what drags a
-                    # sagging pack under the brownout threshold, so let the
-                    # radio settle first. Costs 5 s of awake time.
-                    - delay: 5s
-                    - component.update: epaper
+            # Home Assistant pushes entity updates over the native API. After a
+            # deep-sleep wake the API connection can take a few seconds to come
+            # up and HA then sends the current values, so wait for the two
+            # entities that matter before touching the panel. The timeout keeps
+            # a missing HA from holding the device awake forever.
+            - wait_until:
+                condition:
+                  lambda: return id(wx_temp).has_state() && !isnan(id(wx_temp).state) && id(fcst_all).has_state() && !id(fcst_all).state.empty();
+                timeout: 25s
+            - if:
+                condition:
+                  lambda: return id(wx_temp).has_state() && !isnan(id(wx_temp).state) && id(fcst_all).has_state() && !id(fcst_all).state.empty();
+                then:
+                  # (battery) Separate the HA/WiFi update burst from the
+                  # e-paper refresh. The panel pulls ~20-30 mA for ~20 s while
+                  # it drives the pixels, and the WiFi stack is still pushing
+                  # ACKs out of the radio at the same time. Overlapping the two
+                  # peaks is what drags a sagging pack under the brownout
+                  # threshold, so let the radio settle first.
+                  - delay: 2s
+                  - component.update: epaper
+                else:
+                  - logger.log:
+                      level: WARN
+                      format: "Home Assistant weather entities not ready; keeping the last panel image"
 
 display:
   - platform: epaper_spi
@@ -361,6 +292,11 @@ display:
     lambda: |-
       it.fill(Color::WHITE);
       const int W = it.get_width();
+      // ESPHome mirrors HA's "unavailable"/"unknown" strings verbatim for text
+      // sensors; treat those as no data rather than rendering them.
+      auto valid_text = [](const std::string &s) {
+        return !s.empty() && s != "unavailable" && s != "unknown";
+      };
       // Faux-grayscale: panel driver is binary-only (no 4-level gray in ESPHome),
       // so hierarchy comes from dotted rules + inverted badge instead of gray fills.
       // Header: "October 13th" left, time top-right
@@ -384,7 +320,7 @@ display:
       // Indoor moved to bottom-right (see below).
       // Dotted rule (stipple = faux gray): dots every 6px instead of solid line
       for (int x = 20; x < W - 20; x += 6) it.filled_circle(x, 62, 1, Color::BLACK);
-      if (id(wx_condition).has_state()) {
+      if (id(wx_condition).has_state() && valid_text(id(wx_condition).state)) {
         std::string c = id(wx_condition).state;
         auto *icon = &id(hero_cloudy);
         const char *friendly = "Cloudy";
@@ -399,14 +335,21 @@ display:
         it.image(30, 90, *icon, Color::BLACK, COLOR_OFF);
         it.print(190, 100, id(font_small), Color::BLACK, TextAlign::TOP_LEFT, friendly);
       }
-      if (id(wx_temp).has_state()) {
+      if (id(wx_temp).has_state() && !isnan(id(wx_temp).state)) {
         it.printf(190, 140, id(font_big), Color::BLACK, TextAlign::TOP_LEFT, "%.0fF", id(wx_temp).state);
+        // Humidity/wind are optional: if the source omits them, show "--"
+        // instead of printf'ing nan.
+        char hum[8] = "--";
+        char wind[16] = "--";
+        if (id(wx_humidity).has_state() && !isnan(id(wx_humidity).state)) snprintf(hum, sizeof(hum), "%.0f%%", id(wx_humidity).state);
+        if (id(wx_wind).has_state() && !isnan(id(wx_wind).state)) snprintf(wind, sizeof(wind), "%.0f mph", id(wx_wind).state);
         it.printf(190, 230, id(font_small), Color::BLACK, TextAlign::TOP_LEFT,
-          "H %.0f%%  Wind %.0f mph", id(wx_humidity).state, id(wx_wind).state);
+          "H %s  Wind %s", hum, wind);
       } else {
         it.print(180, 140, id(font_big), Color::BLACK, TextAlign::TOP_LEFT, "--F");
       }
-      if (id(sun_rise).has_state() && id(sun_set).has_state()) {
+      if (id(sun_rise).has_state() && id(sun_set).has_state() &&
+          valid_text(id(sun_rise).state) && valid_text(id(sun_set).state)) {
         it.printf(W - 20, 100, id(font_mono), Color::BLACK, TextAlign::TOP_RIGHT,
           "^%s", id(sun_rise).state.c_str());
         it.printf(W - 20, 140, id(font_mono), Color::BLACK, TextAlign::TOP_RIGHT,
@@ -416,7 +359,21 @@ display:
       // Forecast row: fixed slots, icon 64px, temps BELOW icon with gap. No overlap by construction.
       // Row budget: badge 288-318, icon 324-388, temps 394, footer 440, indoor 444-478.
       int colx[3] = {60, 310, 560};
-      std::string raws[3] = {id(fcst_1).state, id(fcst_2).state, id(fcst_3).state};
+      // All three days arrive in one "Day|hi|lo|code;Day|hi|lo|code;..." string
+      // from Home Assistant (see home-assistant/weather-sign.yaml), so split
+      // it into the same three slots the renderer has always used.
+      std::string raws[3];
+      {
+        std::string all = id(fcst_all).state;
+        if (!valid_text(all)) all.clear();
+        size_t pos = 0;
+        for (int i = 0; i < 3; i++) {
+          size_t nxt = all.find(';', pos);
+          raws[i] = all.substr(pos, nxt == std::string::npos ? std::string::npos : nxt - pos);
+          if (nxt == std::string::npos) break;
+          pos = nxt + 1;
+        }
+      }
       for (int i = 0; i < 3; i++) {
         std::string s = raws[i];
         if (s.empty()) {

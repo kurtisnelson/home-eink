@@ -6,13 +6,14 @@
 #
 # How a cycle works:
 #   1. The ESP32 wakes from deep sleep (timer, or the GPIO3 button).
-#   2. WiFi comes up, the clock syncs, Open-Meteo is polled.
+#   2. WiFi comes up, the clock syncs, and Home Assistant pushes the current
+#      weather entities over the native API.
 #   3. The e-paper panel is redrawn with the new numbers.
 #   4. The device goes back to sleep until the next cycle.
 #
-# What this buys you (2000 mAh pack, 1h refresh, 75 s awake window):
+# What this buys you (2000 mAh pack, 1h refresh, 90 s awake window):
 #   always on : the WiFi radio alone is tens of mA, so the pack lasts hours.
-#   sleep     : ~25 mAh/day, so roughly 2-3 months per charge.
+#   sleep     : ~30 mAh/day, so roughly 2 months per charge.
 # The awake window dominates the budget, not the sleep interval - see the
 # PR description for the full arithmetic and the knobs to turn.
 #
@@ -31,25 +32,24 @@
 substitutions:
   name: weather-sign-sleep
   friendly_name: Weather Sign (Sleep)
-  latitude: !secret latitude
-  longitude: !secret longitude
   # (battery) none keeps the radio in active mode. It only matters for the
   # short awake window here, so the saving is small - but "none" is the most
   # reliable setting and the one this device was reported offline with when it
   # was LIGHT.
   wifi_power_save_mode: none
-  # How often the forecast is refetched *while the device stays awake* (sleep
-  # mode off, or during an extended awake window). In sleep mode the refresh
-  # cadence is set by sleep_interval below.
+  # How often the panel is refreshed from Home Assistant *while the device
+  # stays awake* (sleep mode off, or during an extended awake window). In
+  # sleep mode the refresh cadence is set by sleep_interval below.
   weather_fetch_interval: 30min
   # How long the device stays asleep between refreshes.
   sleep_interval: 1h
   # How long the device stays awake after a wake-up before it is allowed to
   # sleep again. It has to cover: WiFi association (~5 s) + NTP sync (<=10 s)
-  # + the HTTP round trip (~3 s) + the 5 s radio/panel separation + the
-  # e-paper refresh (up to ~30 s). Raise it if the panel is sometimes caught
-  # mid-refresh, lower it to save battery.
-  awake_seconds: 75s
+  # + waiting for Home Assistant to push the weather entities (up to 25 s)
+  # + the 2 s radio/panel separation + the e-paper refresh (up to ~30 s).
+  # Raise it if the panel is sometimes caught mid-refresh, lower it to save
+  # battery.
+  awake_seconds: 90s
   # How long a button press keeps the device awake and connected, so there is
   # time to change the "Sleep Mode" switch in Home Assistant.
   awake_minutes: 5
@@ -92,9 +92,9 @@ time:
     servers:
       - pool.ntp.org
     # NOTE: no on_time_sync -> component.update here. That would redraw the
-    # panel the moment the clock syncs - before the weather fetch has filled
-    # in any data - and burn a full e-paper refresh on a blank panel. The
-    # refresh below is triggered by the fetch instead.
+    # panel the moment the clock syncs - before Home Assistant has pushed the
+    # weather entities - and burn a full e-paper refresh on a blank panel. The
+    # refresh below is triggered by wx_fetch instead.
 
 deep_sleep:
   id: deep_sleep_ctrl
@@ -157,8 +157,9 @@ switch:
 
 script:
   # Called when the WiFi comes up. Waits for the clock (the panel header
-  # shows the date) and then pulls the forecast. The clock wait is bounded so
-  # a broken NTP server cannot stop the panel from updating.
+  # shows the date) and then refreshes from Home Assistant. Both waits are
+  # bounded so a broken NTP server or a missing Home Assistant cannot stop
+  # the panel from updating.
   - id: wake_fetch
     then:
       - wait_until:
@@ -193,7 +194,7 @@ interval:
     startup_delay: ${awake_seconds}
     then:
       - script.execute: sleep_check
-  # Keeps the forecast fresh while the device stays awake (sleep mode off, or
+  # Keeps the panel fresh while the device stays awake (sleep mode off, or
   # during a long awake window). In sleep mode this rarely fires because the
   # device is asleep for most of the hour.
   - interval: ${weather_fetch_interval}
@@ -203,8 +204,8 @@ interval:
 
 wifi:
   # The WiFi is the trigger for a refresh in this build: the panel is redrawn
-  # as soon as the radio is up, which is also when the clock and the forecast
-  # become reachable.
+  # as soon as the radio is up, which is also when the clock becomes reachable
+  # and Home Assistant can push the weather entities over the native API.
   on_connect:
     then:
       - script.execute: wake_fetch
