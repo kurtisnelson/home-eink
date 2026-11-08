@@ -5,7 +5,7 @@
 # pipeline. The two device files only describe what actually differs
 # between them:
 #
-#   weather-sign.yaml        -> always on (WiFi stays up, HA stays connected)
+#   weather-sign.yaml        -> always on (WiFi stays up, HA entity publishing)
 #   weather-sign-sleep.yaml  -> deep sleep (radio off between refreshes)
 #
 # Because ESPHome merges package + device config with the *device* winning for
@@ -15,10 +15,30 @@
 #
 # Substitutions the including device file MUST define:
 #   ${wifi_power_save_mode}        - none | light | high
+#   ${latitude}                    - decimal latitude of the sign (for NWS points lookup)
+#   ${longitude}                   - decimal longitude of the sign (for NWS points lookup)
+#   ${nws_user_agent}              - contact string for the NWS User-Agent header,
+#                                    e.g. "weather-sign/1.0 (your@email.com)"
 #
 # Secrets the including device file MUST provide (used through !secret below):
 #   wifi_ssid, wifi_password, weather_sign__encryption_key,
 #   weather_sign__ota_password
+#
+# Weather data comes directly from the U.S. National Weather Service API
+# (api.weather.gov), queried by the device itself - not from Home Assistant.
+# The device does a points lookup for ${latitude},${longitude}, then reads the
+# forecast and griddata endpoints. No Open-Meteo, no HA weather entity.
+
+globals:
+  # URLs discovered by the NWS points lookup; filled at runtime by wx_fetch.
+  - id: nws_forecast_url
+    type: std::string
+    restore_value: false
+    initial_value: ''
+  - id: nws_griddata_url
+    type: std::string
+    restore_value: false
+    initial_value: ''
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -60,6 +80,14 @@ wifi:
   ap:
     ssid: aaa-broken-weather-sign
 captive_portal:
+
+http_request:
+  id: nws_http
+  # NWS requires a descriptive User-Agent with contact info.
+  useragent: ${nws_user_agent}
+  timeout: 15s
+  verify_ssl: true
+
 
 debug:
   # Publishes the previous reset reason once at boot (brownout vs power-on vs
@@ -149,7 +177,7 @@ image:
       - file: mdi:weather-snowy
         id: hero_snow
 
-# All weather state lives on-device, filled from Home Assistant below.
+# All weather state lives on-device, filled from the NWS API below.
 # Only Room Temp/Humidity + Battery are named => only those go to HA.
 text_sensor:
   - platform: template
@@ -223,6 +251,95 @@ sensor:
       - clamp:
           min_value: 0
           max_value: 100
+script:
+  # Fetches weather from the U.S. National Weather Service (api.weather.gov).
+  # Chain: points lookup -> forecast endpoint -> griddata endpoint (humidity).
+  # Each step reads the previous response via capture_response and on_response.
+  - id: wx_fetch
+    then:
+      # Step 1: NWS points lookup to discover the forecast + griddata URLs.
+      - http_request.get:
+          id: nws_points_req
+          url: !lambda |- return ((std::string) "https://api.weather.gov/points/" + ${latitude} + "," + ${longitude}).c_str();
+          capture_response: true
+          on_response:
+            then:
+              - lambda: |-
+                  json::parse_json(body, [&](JsonObject root) {
+                    auto props = root["properties"];
+                    id(nws_forecast_url) = props["forecast"].as<char const *>();
+                    id(nws_griddata_url) = props["forecastGridData"].as<char const *>();
+                  });
+                    # Step 2: forecast endpoint -> temperature, condition, wind.
+                    - http_request.get:
+                        id: nws_forecast_req
+                        url: !lambda |- return id(nws_forecast_url).c_str();
+                        capture_response: true
+                        on_response:
+                          then:
+                            - lambda: |-
+                                json::parse_json(body, [&](JsonObject root) {
+                                  auto periods = root["properties"]["periods"].as<JsonArray>();
+                                  if (periods.size() == 0) return;
+                                  auto p = periods[0];
+                                  id(wx_temp).publish_state(p["temperature"].as<float>());
+                                  std::string sf = p["shortForecast"].as<std::string>();
+                                  std::string cond = "cloudy";
+                                  std::string lower = sf;
+                                  for (auto &c : lower) c = tolower(c);
+                                  if (lower.find("sunny") != std::string::npos ||
+                                      lower.find("clear") != std::string::npos) {
+                                    cond = id(sntp_time).now().is_valid() &&
+                                           !id(sntp_time).now().is_daytime()
+                                      ? "clear-night" : "sunny";
+                                  } else if (lower.find("partly") != std::string::npos) {
+                                    cond = "partlycloudy";
+                                  } else if (lower.find("cloudy") != std::string::npos ||
+                                             lower.find("overcast") != std::string::npos) {
+                                    cond = "cloudy";
+                                  } else if (lower.find("fog") != std::string::npos ||
+                                             lower.find("hazy") != std::string::npos) {
+                                    cond = "fog";
+                                  } else if (lower.find("rain") != std::string::npos ||
+                                             lower.find("shower") != std::string::npos ||
+                                             lower.find("drizzle") != std::string::npos) {
+                                    cond = "rainy";
+                                  } else if (lower.find("thunder") != std::string::npos ||
+                                             lower.find("storm") != std::string::npos) {
+                                    cond = "storm";
+                                  } else if (lower.find("snow") != std::string::npos ||
+                                             lower.find("sleet") != std::string::npos) {
+                                    cond = "snowy";
+                                  }
+                                  id(wx_condition).publish_state(cond);
+                                  std::string ws = p["windSpeed"].as<std::string>();
+                                  float mph = 0.0f;
+                                  size_t pos = 0;
+                                  while (pos < ws.size() && !isdigit((unsigned char)ws[pos])) pos++;
+                                  if (pos < ws.size()) mph = atof(ws.c_str() + pos);
+                                  id(wx_wind).publish_state(mph);
+                                });
+                            # Step 3: griddata endpoint -> relative humidity.
+                            - http_request.get:
+                                id: nws_griddata_req
+                                url: !lambda |- return id(nws_griddata_url).c_str();
+                                capture_response: true
+                                on_response:
+                                  then:
+                                    - lambda: |-
+                                        json::parse_json(body, [&](JsonObject root) {
+                                          auto props = root["properties"];
+                                          auto rh = props["relativeHumidity"];
+                                          auto values = rh["values"].as<JsonArray>();
+                                          for (auto v : values) {
+                                            if (!v["value"].isNull()) {
+                                              id(wx_humidity).publish_state(v["value"].as<float>());
+                                              break;
+                                            }
+                                          }
+                                        });
+                                    # Step 4: redraw the panel with fresh data.
+                                    - component.update: epaper
 
 display:
   - platform: epaper_spi

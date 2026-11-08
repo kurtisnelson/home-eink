@@ -6,8 +6,8 @@
 #
 # How a cycle works:
 #   1. The ESP32 wakes from deep sleep (timer, or the GPIO3 button).
-#   2. WiFi comes up, the clock syncs, the forecast is refreshed from
-#      Home Assistant.
+#   2. WiFi comes up, the clock syncs, the forecast is refreshed from the
+#      National Weather Service API (queried by the device).
 #   3. The e-paper panel is redrawn with the new numbers.
 #   4. The device goes back to sleep until the next cycle.
 #
@@ -37,6 +37,12 @@ substitutions:
   # reliable setting and the one this device was reported offline with when it
   # was LIGHT.
   wifi_power_save_mode: none
+  # Sign location - required by the NWS points lookup. Set these to the sign's
+  # decimal latitude/longitude (e.g. 37.7749, -122.4194).
+  latitude: 37.7749
+  longitude: -122.4194
+  # Contact string sent in the NWS User-Agent header (NWS requires it).
+  nws_user_agent: "weather-sign/1.0 (you@example.com)"
   # How long the device stays asleep between refreshes.
   sleep_interval: 1h
   # How long the device stays awake after a wake-up before it is allowed to
@@ -160,7 +166,8 @@ script:
           condition:
             lambda: return id(sntp_time).now().is_valid();
           timeout: 10s
-      # Weather is refreshed from Home Assistant once the clock is valid.
+      # Fetch the forecast from the National Weather Service once the clock is valid.
+      - script.execute: wx_fetch
   # Decides whether the device may go back to sleep.
   - id: sleep_check
     then:
@@ -211,6 +218,9 @@ binary_sensor:
       allow_other_uses: true
     id: btn_refresh
     internal: true
+    on_press:
+      then:
+        - script.execute: wx_fetch
 
 packages:
   common: !include packages/weather-sign-common.yaml

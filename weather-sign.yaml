@@ -2,7 +2,7 @@
 #
 # This is the "connected" build: the radio stays up, Home Assistant stays
 # connected, the panel refreshes itself every 15 minutes and the forecast is
-# refreshed from Home Assistant.
+# refreshed from the National Weather Service API (queried by the device).
 #
 # Battery notes for this build:
 #   * The radio is the whole budget. With `wifi_power_save_mode: none` the
@@ -26,6 +26,12 @@ substitutions:
   # slow reconnection on a weak signal. Try it with a spare battery first;
   # switching it back is a one-line change.
   wifi_power_save_mode: none
+  # Sign location - required by the NWS points lookup. Set these to the sign's
+  # decimal latitude/longitude (e.g. 37.7749, -122.4194).
+  latitude: 37.7749
+  longitude: -122.4194
+  # Contact string sent in the NWS User-Agent header (NWS requires it).
+  nws_user_agent: "weather-sign/1.0 (you@example.com)"
 
 esphome:
   name: ${name}
@@ -67,6 +73,13 @@ time:
       then:
         - component.update: epaper
 
+interval:
+  # Refetch the forecast from the National Weather Service every 30 minutes
+  # and redraw the panel.
+  - interval: 30min
+    then:
+      - script.execute: wx_fetch
+
 binary_sensor:
   # The button on the back of the sign: a manual refresh, for when the
   # forecast on the panel is older than you would like.
@@ -77,6 +90,9 @@ binary_sensor:
       mode: INPUT_PULLUP
     id: btn_refresh
     internal: true
+    on_press:
+      then:
+        - script.execute: wx_fetch
 
 packages:
   common: !include packages/weather-sign-common.yaml
