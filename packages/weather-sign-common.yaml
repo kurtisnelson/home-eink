@@ -263,7 +263,6 @@ script:
     then:
       # Step 1: NWS points lookup to discover the forecast + griddata URLs.
       - http_request.get:
-          id: nws_points_req
           url: !lambda |
             return std::string("https://api.weather.gov/points/") + "${latitude}" + "," + "${longitude}";
           capture_response: true
@@ -281,7 +280,6 @@ script:
     then:
       # Step 2: forecast endpoint -> temperature, condition, wind.
       - http_request.get:
-          id: nws_forecast_req
           url: !lambda |
             return id(nws_forecast_url).c_str();
           capture_response: true
@@ -363,7 +361,6 @@ script:
     then:
       # Step 3: griddata endpoint -> relative humidity.
       - http_request.get:
-          id: nws_griddata_req
           url: !lambda |
             return id(nws_griddata_url).c_str();
           capture_response: true
