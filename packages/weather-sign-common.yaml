@@ -1,11 +1,11 @@
 # Shared hardware + weather pipeline for the Seeed reTerminal E1001 weather sign.
 #
 # Everything both power modes have in common lives here exactly once:
-# the board, the radios, the sensors, the e-paper panel and the Open-Meteo
-# fetch pipeline. The two device files only describe what actually differs
+# the board, the radios, the sensors, the e-paper panel and the weather
+# pipeline. The two device files only describe what actually differs
 # between them:
 #
-#   weather-sign.yaml        -> always on (WiFi stays up, HA stays connected)
+#   weather-sign.yaml        -> always on (WiFi stays up, HA entity publishing)
 #   weather-sign-sleep.yaml  -> deep sleep (radio off between refreshes)
 #
 # Because ESPHome merges package + device config with the *device* winning for
@@ -14,13 +14,31 @@
 # deliberately NOT defined in this package when a device also defines it.
 #
 # Substitutions the including device file MUST define:
-#   ${latitude}, ${longitude}      - sign location (from secrets)
 #   ${wifi_power_save_mode}        - none | light | high
-#   ${weather_fetch_interval}      - how often the forecast is refetched
+#   ${latitude}                    - decimal latitude of the sign (for NWS points lookup)
+#   ${longitude}                   - decimal longitude of the sign (for NWS points lookup)
+#   ${nws_user_agent}              - contact string for the NWS User-Agent header,
+#                                    e.g. "weather-sign/1.0 (your@email.com)"
 #
 # Secrets the including device file MUST provide (used through !secret below):
 #   wifi_ssid, wifi_password, weather_sign__encryption_key,
 #   weather_sign__ota_password
+#
+# Weather data comes directly from the U.S. National Weather Service API
+# (api.weather.gov), queried by the device itself - not from Home Assistant.
+# The device does a points lookup for ${latitude},${longitude}, then reads the
+# forecast and griddata endpoints. Home Assistant is not involved in fetching.
+
+globals:
+  # URLs discovered by the NWS points lookup; filled at runtime by wx_fetch.
+  - id: nws_forecast_url
+    type: std::string
+    restore_value: false
+    initial_value: ''
+  - id: nws_griddata_url
+    type: std::string
+    restore_value: false
+    initial_value: ''
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -62,6 +80,14 @@ wifi:
   ap:
     ssid: aaa-broken-weather-sign
 captive_portal:
+
+http_request:
+  id: nws_http
+  # NWS requires a descriptive User-Agent with contact info.
+  useragent: ${nws_user_agent}
+  timeout: 15s
+  verify_ssl: true
+
 
 debug:
   # Publishes the previous reset reason once at boot (brownout vs power-on vs
@@ -151,7 +177,7 @@ image:
       - file: mdi:weather-snowy
         id: hero_snow
 
-# All weather state lives on-device, filled by Open-Meteo fetch below.
+# All weather state lives on-device, filled from the NWS API below.
 # Only Room Temp/Humidity + Battery are named => only those go to HA.
 text_sensor:
   - platform: template
@@ -225,131 +251,135 @@ sensor:
       - clamp:
           min_value: 0
           max_value: 100
-
-http_request:
-  verify_ssl: false
-  timeout: 15s
-json:
-
 script:
+  # Fetches weather from the U.S. National Weather Service (api.weather.gov).
+  # Chain (run on device): points lookup -> forecast -> griddata -> redraw.
+  # Each step publishes its data and triggers the next step via script.execute.
   - id: wx_fetch
     then:
-      # Survive a sagging battery: below ~3.30 V skip the network round-trip
-      # (the CPU/TLS/radio burst) and hold the last image rather than adding a
-      # current spike that can trip the brownout detector. The panel's own
-      # update_interval still runs, so the display is never frozen.
-      - if:
-          condition:
-            lambda: return !isnan(id(batt_v).state) && id(batt_v).state < 3.30f;
-          then:
-            - logger.log:
-                level: WARN
-                format: "Battery low (%.2f V): skipping weather fetch"
-                args: ['id(batt_v).state']
-          else:
-            - script.execute: wx_do_fetch
-  # Split out so wx_fetch can skip the fetch entirely when the battery is low.
-  - id: wx_do_fetch
+      - script.execute: wx_fetch_points
+
+  - id: wx_fetch_points
     then:
+      # Step 1: NWS points lookup to discover the forecast + griddata URLs.
       - http_request.get:
-          url: https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m,is_day&daily=temperature_2m_max,temperature_2m_min,weather_code,sunrise,sunset&timezone=auto&forecast_days=4&temperature_unit=fahrenheit&wind_speed_unit=mph
+          url: !lambda |
+            return std::string("https://api.weather.gov/points/") + "${latitude}" + "," + "${longitude}";
           capture_response: true
-          max_response_buffer_size: 4096
           on_response:
             then:
-              - if:
-                  condition:
-                    lambda: return response->status_code == 200;
-                  then:
-                    - lambda: |-
-                        json::parse_json(body, [](JsonObject root) -> bool {
-                          auto cur = root["current"];
-                          if (!cur.isNull()) {
-                            id(wx_temp).publish_state(cur["temperature_2m"].as<float>());
-                            id(wx_humidity).publish_state(cur["relative_humidity_2m"].as<float>());
-                            id(wx_wind).publish_state(cur["wind_speed_10m"].as<float>());
-                            int code = cur["weather_code"].as<int>();
-                            int is_day = cur["is_day"].as<int>();
-                            id(wx_code).publish_state((float)code);
-                            // WMO weather-code -> short label
-                            std::string label = "cloudy";
-                            if (code == 0) label = (is_day ? "sunny" : "clear-night");
-                            else if (code <= 3) label = (code == 1 ? "partlycloudy" : "cloudy");
-                            else if (code <= 48) label = "fog";
-                            else if (code <= 67) label = "rainy";
-                            else if (code <= 77) label = "snowy";
-                            else if (code <= 82) label = "rainy";
-                            else if (code <= 86) label = "snowy";
-                            else if (code <= 99) label = "storm";
-                            id(wx_condition).publish_state(label);
-                          }
-                          auto daily = root["daily"];
-                          if (!daily.isNull()) {
-                            // daily["sunrise"][0] / ["sunset"][0] are ISO local "YYYY-MM-DDTHH:MM"
-                            auto fmt_time = [](const char *iso) -> std::string {
-                              if (iso == nullptr || *iso == '\0') return "";
-                              std::string s = iso;
-                              auto t = s.find('T');
-                              std::string hm = (t == std::string::npos) ? s : s.substr(t + 1, 5);
-                              if (hm.size() < 5) return "";
-                              int hh = atoi(hm.substr(0, 2).c_str());
-                              std::string mm = hm.substr(3, 2);
-                              const char *ap = (hh >= 12) ? "p" : "a";
-                              int h12 = hh % 12; if (h12 == 0) h12 = 12;
-                              char b[16]; snprintf(b, sizeof(b), "%d:%s%s", h12, mm.c_str(), ap);
-                              return std::string(b);
-                            };
-                            auto sr = daily["sunrise"];
-                            auto ss = daily["sunset"];
-                            if (!sr.isNull() && !ss.isNull()) {
-                              auto sr_s = fmt_time(sr[0].as<const char *>());
-                              auto ss_s = fmt_time(ss[0].as<const char *>());
-                              if (!sr_s.empty()) id(sun_rise).publish_state(sr_s);
-                              if (!ss_s.empty()) id(sun_set).publish_state(ss_s);
-                            }
-                            auto tmax = daily["temperature_2m_max"];
-                            auto tmin = daily["temperature_2m_min"];
-                            auto dates = daily["time"];
-                            auto dcodes = daily["weather_code"];
-                            // Guard every array: a partial/odd API payload used to reach
-                            // std::string(nullptr) below and panic into a reboot loop.
-                            if (!dates.isNull() && !tmax.isNull() && !tmin.isNull() && !dcodes.isNull()) {
-                              const char *wdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-                              for (int i = 0; i < 3; i++) {
-                                const char *dstr = dates[i+1].as<const char *>();
-                                if (dstr == nullptr || strlen(dstr) < 10) continue;
-                                std::string d = dstr;
-                                // d = YYYY-MM-DD -> weekday via Sakamoto
-                                int y = atoi(d.substr(0,4).c_str());
-                                int m = atoi(d.substr(5,2).c_str());
-                                int day = atoi(d.substr(8,2).c_str());
-                                if (m < 1 || m > 12 || day < 1 || day > 31) continue;
-                                int yy = y; static const int t_[] = {0,3,2,5,0,3,5,1,4,6,2,4};
-                                if (m < 3) yy -= 1;
-                                int wd = (yy + yy/4 - yy/100 + yy/400 + t_[m-1] + day) % 7;
-                                int hi = (int)tmax[i+1].as<float>();
-                                int lo = (int)tmin[i+1].as<float>();
-                                int dc = dcodes[i+1].as<int>();
-                                char buf[32];
-                                snprintf(buf, sizeof(buf), "%s|%d|%d|%d", wdays[wd], hi, lo, dc);
-                                std::string s = buf;
-                                if (i == 0) id(fcst_1).publish_state(s);
-                                if (i == 1) id(fcst_2).publish_state(s);
-                                if (i == 2) id(fcst_3).publish_state(s);
-                              }
-                            }
-                          }
-                          return true;
-                        });
-                    # (battery) Separate the radio TX burst of the HTTP response
-                    # from the e-paper refresh. The panel pulls ~20-30 mA for
-                    # ~20 s while it drives the pixels, and the WiFi stack is
-                    # still pushing the HTTP response/ACK out of the radio at
-                    # the same time. Overlapping the two peaks is what drags a
-                    # sagging pack under the brownout threshold, so let the
-                    # radio settle first. Costs 5 s of awake time.
-                    - delay: 5s
-                    - component.update: epaper
+              - lambda: |-
+                  json::parse_json(body, [&](JsonObject root) {
+                    auto props = root["properties"];
+                    id(nws_forecast_url) = std::string(props["forecast"].as<const char *>());
+                    id(nws_griddata_url) = std::string(props["forecastGridData"].as<const char *>());
+                  });
+              - script.execute: wx_fetch_forecast
+
+  - id: wx_fetch_forecast
+    then:
+      # Step 2: forecast endpoint -> temperature, condition, wind.
+      - http_request.get:
+          url: !lambda |
+            return id(nws_forecast_url).c_str();
+          capture_response: true
+          on_response:
+            then:
+              - lambda: |-
+                  json::parse_json(body, [&](JsonObject root) {
+                    auto periods = root["properties"]["periods"].as<JsonArray>();
+                    if (periods.size() == 0) return;
+                    auto p = periods[0];
+                    id(wx_temp).publish_state(p["temperature"].as<float>());
+                    std::string sf = std::string(p["shortForecast"].as<const char *>());
+                    std::string cond = "cloudy";
+                    std::string lower = sf;
+                    for (auto &c : lower) c = tolower(c);
+                    if (lower.find("sunny") != std::string::npos ||
+                        lower.find("clear") != std::string::npos) {
+                      cond = id(sntp_time).now().is_valid() &&
+                             !id(sntp_time).now().is_daytime()
+                        ? "clear-night" : "sunny";
+                    } else if (lower.find("partly") != std::string::npos) {
+                      cond = "partlycloudy";
+                    } else if (lower.find("cloudy") != std::string::npos ||
+                               lower.find("overcast") != std::string::npos) {
+                      cond = "cloudy";
+                    } else if (lower.find("fog") != std::string::npos ||
+                               lower.find("hazy") != std::string::npos) {
+                      cond = "fog";
+                    } else if (lower.find("rain") != std::string::npos ||
+                               lower.find("shower") != std::string::npos ||
+                               lower.find("drizzle") != std::string::npos) {
+                      cond = "rainy";
+                    } else if (lower.find("thunder") != std::string::npos ||
+                               lower.find("storm") != std::string::npos) {
+                      cond = "storm";
+                    } else if (lower.find("snow") != std::string::npos ||
+                               lower.find("sleet") != std::string::npos) {
+                      cond = "snowy";
+                    }
+                    id(wx_condition).publish_state(cond);
+                    std::string ws = std::string(p["windSpeed"].as<const char *>());
+                    float mph = 0.0f;
+                    size_t pos = 0;
+                    while (pos < ws.size() && !isdigit((unsigned char)ws[pos])) pos++;
+                    if (pos < ws.size()) mph = atof(ws.c_str() + pos);
+                    id(wx_wind).publish_state(mph);
+                    // Fill fcst_1/2/3 from the next three periods: name|hi|lo|code
+                    for (size_t i = 1; i < periods.size() && i <= 3; i++) {
+                      auto pp = periods[i];
+                      std::string name = std::string(pp["name"].as<const char *>());
+                      int temp = (int) pp["temperature"].as<float>();
+                      std::string sf2 = std::string(pp["shortForecast"].as<const char *>());
+                      std::string lower2 = sf2;
+                      for (auto &c : lower2) c = tolower(c);
+                      int dc = 1;
+                      if (lower2.find("sunny") != std::string::npos ||
+                          lower2.find("clear") != std::string::npos) dc = 0;
+                      else if (lower2.find("partly") != std::string::npos) dc = 1;
+                      else if (lower2.find("cloudy") != std::string::npos ||
+                               lower2.find("overcast") != std::string::npos) dc = 2;
+                      else if (lower2.find("fog") != std::string::npos ||
+                               lower2.find("hazy") != std::string::npos) dc = 3;
+                      else if (lower2.find("rain") != std::string::npos ||
+                               lower2.find("shower") != std::string::npos ||
+                               lower2.find("drizzle") != std::string::npos) dc = 6;
+                      else if (lower2.find("thunder") != std::string::npos ||
+                               lower2.find("storm") != std::string::npos) dc = 8;
+                      else if (lower2.find("snow") != std::string::npos ||
+                               lower2.find("sleet") != std::string::npos) dc = 7;
+                      std::string out = name + "|" + std::to_string(temp) + "|" + std::to_string(temp) + "|" + std::to_string(dc);
+                      if (i == 1) id(fcst_1).publish_state(out);
+                      else if (i == 2) id(fcst_2).publish_state(out);
+                      else if (i == 3) id(fcst_3).publish_state(out);
+                    }
+                  });
+              - script.execute: wx_fetch_humidity
+
+  - id: wx_fetch_humidity
+    then:
+      # Step 3: griddata endpoint -> relative humidity.
+      - http_request.get:
+          url: !lambda |
+            return id(nws_griddata_url).c_str();
+          capture_response: true
+          on_response:
+            then:
+              - lambda: |-
+                  json::parse_json(body, [&](JsonObject root) {
+                    auto props = root["properties"];
+                    auto rh = props["relativeHumidity"];
+                    auto values = rh["values"].as<JsonArray>();
+                    for (auto v : values) {
+                      if (!v["value"].isNull()) {
+                        id(wx_humidity).publish_state(v["value"].as<float>());
+                        break;
+                      }
+                    }
+                  });
+              # Step 4: redraw the panel with fresh data.
+              - component.update: epaper
 
 display:
   - platform: epaper_spi
