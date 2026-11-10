@@ -272,8 +272,8 @@ script:
               - lambda: |-
                   json::parse_json(body, [&](JsonObject root) {
                     auto props = root["properties"];
-                    id(nws_forecast_url) = props["forecast"].as<std::string>();
-                    id(nws_griddata_url) = props["forecastGridData"].as<std::string>();
+                    id(nws_forecast_url) = std::string(props["forecast"].as<const char *>());
+                    id(nws_griddata_url) = std::string(props["forecastGridData"].as<const char *>());
                   });
               - script.execute: wx_fetch_forecast
 
@@ -293,7 +293,7 @@ script:
                     if (periods.size() == 0) return;
                     auto p = periods[0];
                     id(wx_temp).publish_state(p["temperature"].as<float>());
-                    std::string sf = p["shortForecast"].as<std::string>();
+                    std::string sf = std::string(p["shortForecast"].as<const char *>());
                     std::string cond = "cloudy";
                     std::string lower = sf;
                     for (auto &c : lower) c = tolower(c);
@@ -322,7 +322,7 @@ script:
                       cond = "snowy";
                     }
                     id(wx_condition).publish_state(cond);
-                    std::string ws = p["windSpeed"].as<std::string>();
+                    std::string ws = std::string(p["windSpeed"].as<const char *>());
                     float mph = 0.0f;
                     size_t pos = 0;
                     while (pos < ws.size() && !isdigit((unsigned char)ws[pos])) pos++;
@@ -331,9 +331,9 @@ script:
                     // Fill fcst_1/2/3 from the next three periods: name|hi|lo|code
                     for (size_t i = 1; i < periods.size() && i <= 3; i++) {
                       auto pp = periods[i];
-                      std::string name = pp["name"].as<std::string>();
+                      std::string name = std::string(pp["name"].as<const char *>());
                       int temp = (int) pp["temperature"].as<float>();
-                      std::string sf2 = pp["shortForecast"].as<std::string>();
+                      std::string sf2 = std::string(pp["shortForecast"].as<const char *>());
                       std::string lower2 = sf2;
                       for (auto &c : lower2) c = tolower(c);
                       int dc = 1;
