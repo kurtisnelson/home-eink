@@ -253,93 +253,136 @@ sensor:
           max_value: 100
 script:
   # Fetches weather from the U.S. National Weather Service (api.weather.gov).
-  # Chain: points lookup -> forecast endpoint -> griddata endpoint (humidity).
-  # Each step reads the previous response via capture_response and on_response.
+  # Chain (run on device): points lookup -> forecast -> griddata -> redraw.
+  # Each step publishes its data and triggers the next step via script.execute.
   - id: wx_fetch
+    then:
+      - script.execute: wx_fetch_points
+
+  - id: wx_fetch_points
     then:
       # Step 1: NWS points lookup to discover the forecast + griddata URLs.
       - http_request.get:
           id: nws_points_req
-          url: !lambda |- return ((std::string) "https://api.weather.gov/points/" + ${latitude} + "," + ${longitude}).c_str();
+          url: !lambda |
+            return std::string("https://api.weather.gov/points/") + "${latitude}" + "," + "${longitude}";
           capture_response: true
           on_response:
             then:
               - lambda: |-
                   json::parse_json(body, [&](JsonObject root) {
                     auto props = root["properties"];
-                    id(nws_forecast_url) = props["forecast"].as<char const *>();
-                    id(nws_griddata_url) = props["forecastGridData"].as<char const *>();
+                    id(nws_forecast_url) = props["forecast"].as<std::string>();
+                    id(nws_griddata_url) = props["forecastGridData"].as<std::string>();
                   });
-                    # Step 2: forecast endpoint -> temperature, condition, wind.
-                    - http_request.get:
-                        id: nws_forecast_req
-                        url: !lambda |- return id(nws_forecast_url).c_str();
-                        capture_response: true
-                        on_response:
-                          then:
-                            - lambda: |-
-                                json::parse_json(body, [&](JsonObject root) {
-                                  auto periods = root["properties"]["periods"].as<JsonArray>();
-                                  if (periods.size() == 0) return;
-                                  auto p = periods[0];
-                                  id(wx_temp).publish_state(p["temperature"].as<float>());
-                                  std::string sf = p["shortForecast"].as<std::string>();
-                                  std::string cond = "cloudy";
-                                  std::string lower = sf;
-                                  for (auto &c : lower) c = tolower(c);
-                                  if (lower.find("sunny") != std::string::npos ||
-                                      lower.find("clear") != std::string::npos) {
-                                    cond = id(sntp_time).now().is_valid() &&
-                                           !id(sntp_time).now().is_daytime()
-                                      ? "clear-night" : "sunny";
-                                  } else if (lower.find("partly") != std::string::npos) {
-                                    cond = "partlycloudy";
-                                  } else if (lower.find("cloudy") != std::string::npos ||
-                                             lower.find("overcast") != std::string::npos) {
-                                    cond = "cloudy";
-                                  } else if (lower.find("fog") != std::string::npos ||
-                                             lower.find("hazy") != std::string::npos) {
-                                    cond = "fog";
-                                  } else if (lower.find("rain") != std::string::npos ||
-                                             lower.find("shower") != std::string::npos ||
-                                             lower.find("drizzle") != std::string::npos) {
-                                    cond = "rainy";
-                                  } else if (lower.find("thunder") != std::string::npos ||
-                                             lower.find("storm") != std::string::npos) {
-                                    cond = "storm";
-                                  } else if (lower.find("snow") != std::string::npos ||
-                                             lower.find("sleet") != std::string::npos) {
-                                    cond = "snowy";
-                                  }
-                                  id(wx_condition).publish_state(cond);
-                                  std::string ws = p["windSpeed"].as<std::string>();
-                                  float mph = 0.0f;
-                                  size_t pos = 0;
-                                  while (pos < ws.size() && !isdigit((unsigned char)ws[pos])) pos++;
-                                  if (pos < ws.size()) mph = atof(ws.c_str() + pos);
-                                  id(wx_wind).publish_state(mph);
-                                });
-                            # Step 3: griddata endpoint -> relative humidity.
-                            - http_request.get:
-                                id: nws_griddata_req
-                                url: !lambda |- return id(nws_griddata_url).c_str();
-                                capture_response: true
-                                on_response:
-                                  then:
-                                    - lambda: |-
-                                        json::parse_json(body, [&](JsonObject root) {
-                                          auto props = root["properties"];
-                                          auto rh = props["relativeHumidity"];
-                                          auto values = rh["values"].as<JsonArray>();
-                                          for (auto v : values) {
-                                            if (!v["value"].isNull()) {
-                                              id(wx_humidity).publish_state(v["value"].as<float>());
-                                              break;
-                                            }
-                                          }
-                                        });
-                                    # Step 4: redraw the panel with fresh data.
-                                    - component.update: epaper
+              - script.execute: wx_fetch_forecast
+
+  - id: wx_fetch_forecast
+    then:
+      # Step 2: forecast endpoint -> temperature, condition, wind.
+      - http_request.get:
+          id: nws_forecast_req
+          url: !lambda |
+            return id(nws_forecast_url).c_str();
+          capture_response: true
+          on_response:
+            then:
+              - lambda: |-
+                  json::parse_json(body, [&](JsonObject root) {
+                    auto periods = root["properties"]["periods"].as<JsonArray>();
+                    if (periods.size() == 0) return;
+                    auto p = periods[0];
+                    id(wx_temp).publish_state(p["temperature"].as<float>());
+                    std::string sf = p["shortForecast"].as<std::string>();
+                    std::string cond = "cloudy";
+                    std::string lower = sf;
+                    for (auto &c : lower) c = tolower(c);
+                    if (lower.find("sunny") != std::string::npos ||
+                        lower.find("clear") != std::string::npos) {
+                      cond = id(sntp_time).now().is_valid() &&
+                             !id(sntp_time).now().is_daytime()
+                        ? "clear-night" : "sunny";
+                    } else if (lower.find("partly") != std::string::npos) {
+                      cond = "partlycloudy";
+                    } else if (lower.find("cloudy") != std::string::npos ||
+                               lower.find("overcast") != std::string::npos) {
+                      cond = "cloudy";
+                    } else if (lower.find("fog") != std::string::npos ||
+                               lower.find("hazy") != std::string::npos) {
+                      cond = "fog";
+                    } else if (lower.find("rain") != std::string::npos ||
+                               lower.find("shower") != std::string::npos ||
+                               lower.find("drizzle") != std::string::npos) {
+                      cond = "rainy";
+                    } else if (lower.find("thunder") != std::string::npos ||
+                               lower.find("storm") != std::string::npos) {
+                      cond = "storm";
+                    } else if (lower.find("snow") != std::string::npos ||
+                               lower.find("sleet") != std::string::npos) {
+                      cond = "snowy";
+                    }
+                    id(wx_condition).publish_state(cond);
+                    std::string ws = p["windSpeed"].as<std::string>();
+                    float mph = 0.0f;
+                    size_t pos = 0;
+                    while (pos < ws.size() && !isdigit((unsigned char)ws[pos])) pos++;
+                    if (pos < ws.size()) mph = atof(ws.c_str() + pos);
+                    id(wx_wind).publish_state(mph);
+                    // Fill fcst_1/2/3 from the next three periods: name|hi|lo|code
+                    for (size_t i = 1; i < periods.size() && i <= 3; i++) {
+                      auto pp = periods[i];
+                      std::string name = pp["name"].as<std::string>();
+                      int temp = (int) pp["temperature"].as<float>();
+                      std::string sf2 = pp["shortForecast"].as<std::string>();
+                      std::string lower2 = sf2;
+                      for (auto &c : lower2) c = tolower(c);
+                      int dc = 1;
+                      if (lower2.find("sunny") != std::string::npos ||
+                          lower2.find("clear") != std::string::npos) dc = 0;
+                      else if (lower2.find("partly") != std::string::npos) dc = 1;
+                      else if (lower2.find("cloudy") != std::string::npos ||
+                               lower2.find("overcast") != std::string::npos) dc = 2;
+                      else if (lower2.find("fog") != std::string::npos ||
+                               lower2.find("hazy") != std::string::npos) dc = 3;
+                      else if (lower2.find("rain") != std::string::npos ||
+                               lower2.find("shower") != std::string::npos ||
+                               lower2.find("drizzle") != std::string::npos) dc = 6;
+                      else if (lower2.find("thunder") != std::string::npos ||
+                               lower2.find("storm") != std::string::npos) dc = 8;
+                      else if (lower2.find("snow") != std::string::npos ||
+                               lower2.find("sleet") != std::string::npos) dc = 7;
+                      std::string out = name + "|" + std::to_string(temp) + "|" + std::to_string(temp) + "|" + std::to_string(dc);
+                      if (i == 1) id(fcst_1).publish_state(out);
+                      else if (i == 2) id(fcst_2).publish_state(out);
+                      else if (i == 3) id(fcst_3).publish_state(out);
+                    }
+                  });
+              - script.execute: wx_fetch_humidity
+
+  - id: wx_fetch_humidity
+    then:
+      # Step 3: griddata endpoint -> relative humidity.
+      - http_request.get:
+          id: nws_griddata_req
+          url: !lambda |
+            return id(nws_griddata_url).c_str();
+          capture_response: true
+          on_response:
+            then:
+              - lambda: |-
+                  json::parse_json(body, [&](JsonObject root) {
+                    auto props = root["properties"];
+                    auto rh = props["relativeHumidity"];
+                    auto values = rh["values"].as<JsonArray>();
+                    for (auto v : values) {
+                      if (!v["value"].isNull()) {
+                        id(wx_humidity).publish_state(v["value"].as<float>());
+                        break;
+                      }
+                    }
+                  });
+              # Step 4: redraw the panel with fresh data.
+              - component.update: epaper
 
 display:
   - platform: epaper_spi

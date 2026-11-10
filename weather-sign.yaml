@@ -28,8 +28,8 @@ substitutions:
   wifi_power_save_mode: none
   # Sign location - required by the NWS points lookup. Set these to the sign's
   # decimal latitude/longitude (e.g. 37.7749, -122.4194).
-  latitude: 37.7749
-  longitude: -122.4194
+  latitude: "37.7749"
+  longitude: "-122.4194"
   # Contact string sent in the NWS User-Agent header (NWS requires it).
   nws_user_agent: "weather-sign/1.0 (you@example.com)"
 
