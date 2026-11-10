@@ -27,7 +27,7 @@
 # Weather data comes directly from the U.S. National Weather Service API
 # (api.weather.gov), queried by the device itself - not from Home Assistant.
 # The device does a points lookup for ${latitude},${longitude}, then reads the
-# forecast and griddata endpoints. No Open-Meteo, no HA weather entity.
+# forecast and griddata endpoints. Home Assistant is not involved in fetching.
 
 globals:
   # URLs discovered by the NWS points lookup; filled at runtime by wx_fetch.
